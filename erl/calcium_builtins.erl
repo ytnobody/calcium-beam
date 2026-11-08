@@ -1,7 +1,7 @@
 %% Erlang/OTP support for Calcium's always-available built-in functions
 %% (Stage 2/3 subset: only what the current fixtures and reused stdlib
 %% source exercise). See ../docs/DECISIONS.md D6 for the dispatch
-%% convention and D7 for the Maybe-wrapping this intentionally defers.
+%% convention.
 -module(calcium_builtins).
 -export([len/1, head/1, tail/1, to_string/1,
          map/2, filter/2, reduce/3, concat/2, push/2, range/2,
@@ -12,11 +12,13 @@ len(X) when is_binary(X) -> string:length(X);
 len(X) when is_map(X) -> maps:size(X);
 len(X) when is_tuple(X) -> tuple_size(X).
 
-%% head/tail return the raw value/crash on an empty array rather than
-%% Maybe.Some/Maybe.None, unlike the reference implementation - see
-%% docs/DECISIONS.md D7.
-head([H | _]) -> H.
+%% head returns Maybe.Some(H)/Maybe.None (pkg/vm/vm.go's builtinHead);
+%% tail returns a raw empty array on an empty input, never Maybe
+%% (builtinTail) - these two differ from each other, not a typo.
+head([]) -> 'None';
+head([H | _]) -> {'Some', H}.
 
+tail([]) -> [];
 tail([_ | T]) -> T.
 
 to_string(X) when is_binary(X) -> X;

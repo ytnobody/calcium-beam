@@ -55,17 +55,35 @@ Installed locally; `pkg/codegen`'s end-to-end test
 `PATH` and skips otherwise. `.github/workflows/ci.yml` installs OTP via
 `erlef/setup-beam`.
 
-## D5 — `func!` and `!>` don't yet wrap in `success`/`failure` (**open**, tracked)
+## D5 — `func!` unconditionally wraps its body in `{ok, V}` (**decided**)
 
-The reference compiler wraps a `func!` body's return value in `success(...)`
-automatically unless the body already produced a Result (`pkg/compiler/compiler.go`
-around the `hasConstraints`/`node.IsEffect` check). `calcium-beam` currently
-compiles `func!` identically to `func` - no automatic wrap - so an effect
-function's result isn't yet a `{ok, _}` unless its body says so explicitly.
-`!>`/`!!!>` (`EffectPipeExpression`) are likewise compiled exactly like `|>`
-for now. Not a correctness problem for the programs Stage 1/2 target (none
-rely on implicit effect wrapping yet), but must be resolved before Stage 3
-claims effect support.
+Verified empirically against the real reference VM (not just read off the
+Go source): `OpWrapSuccess` really is unconditional
+(`pkg/compiler/compiler.go`'s `if node.IsEffect || hasConstraints { c.emit(bytecode.OpWrapSuccess) }`,
+and the opcode itself in `pkg/vm/vm.go` is a plain `value.Success(vm.pop())`,
+no idempotency check). A `func!` that wraps a plain `.ca` function call
+which already returns `success`/`failure` really does double-wrap:
+`func! wrapper(x) = returns_result(x);` prints `success(success(5))`/
+`success(failure(negative))`, confirmed against `calciumbeam`'s own `calcium`
+build.
+
+The one exception, also confirmed empirically: a `func!` whose body is a
+*direct* call to a native primitive or stdlib function (`io.write_file`,
+backed by `__write_file`, which itself returns `success(Maybe.None)`/
+`failure(err)` in Go) prints exactly one level -
+`success(Maybe.None)`, not `success(success(Maybe.None))`. The primitive-
+call machinery evidently treats a primitive's own Go-level Success/Failure
+specially rather than letting it flow through as an ordinary Calcium value
+subject to the same wrap. `functionDecl` in `pkg/codegen/codegen.go`
+implements this: wrap in `{ok, V}` unless `fd.Body` is a direct call
+dispatched via `builtinCalls`/`stdlibCalls` (D6), via the new
+`isDirectPrimitiveOrStdlibCall` helper.
+
+`!>`/`!!!>` (`EffectPipeExpression`) needed no change: the reference
+compiler's own comment confirms it ("just call normally - func! already
+wraps return in success") - the wrap lives entirely in the callee's
+compiled body, not at the pipe call site, and `pipe()` already compiles
+both operators identically.
 
 ## D6 — stdlib calls are dispatched by `module.function` name, not by resolving `use` (**decided**)
 
@@ -73,22 +91,28 @@ A `use core.io!;` statement has no runtime effect in generated code
 (`renderModule` skips `*ast.UseStatement` outright). Instead,
 `stdlibCalls` in `pkg/codegen/codegen.go` is a fixed table mapping
 `module.function` strings to their `erl/` implementation
-(`io.say` → `calcium_io:say`, see `erl/calcium_io.erl`), checked at the call
+(`io.say` → `calcium_io_native:say`, see `erl/calcium_io_native.erl`), checked at the call
 site. This avoids implementing Calcium's module resolution/search path for
 something that, in `calcium-beam`, is always a fixed, finite set of
 standard-library modules - there is no third-party `.ca` module loading to
 support here, unlike the reference VM. An unmapped `module.function` is a
 hard compile error naming both parts, not a silent miscompile.
 
-## D7 — `head`/`tail` don't yet return `Maybe` (**open**, tracked)
+## D7 — `head` returns `Maybe`; `tail` returns a raw empty array, not `Maybe` (**decided**)
 
-The reference implementation's `head(array)` returns `Maybe.Some(value)` /
-`Maybe.None` (see `calcium-lang`'s `Null` → `Maybe` breaking change), and
-`tail` on an empty array is presumably similarly guarded. `erl/calcium_builtins.erl`'s
-`head/1`/`tail/1` currently pattern-match `[H|_]`/`[_|T]` directly and crash
-on an empty list instead. Acceptable for Stage 2 fixtures (none call `head`/`tail`
-on an empty array), but must be fixed - wrapping in `{ok, 'Some', V}`/`'None'`
-per D3's tagged-tuple convention - before claiming general array stdlib support.
+Checked `pkg/vm/vm.go`'s actual `builtinHead`/`builtinTail` directly rather
+than assume they're symmetric: `head([])` returns `'None'`,
+`head([H|_])` returns `{'Some', H}` (D3's tagged-tuple convention) - but
+`tail([])` returns a plain empty array `[]`, *not* `Maybe.None`, and
+`tail([_|T])` returns `T` same as before. `erl/calcium_builtins.erl`
+previously pattern-matched `[H|_]`/`[_|T]` directly and crashed on an
+empty list instead of matching either reference behavior; fixed with an
+explicit `[]` clause for each, returning the correct (and correctly
+*different*) shape per function. No stdlib `.ca` file (`array.ca` included)
+calls `head` at all, and every `tail` call site already guards the
+empty-array case with its own length check before calling it, so this was
+a pure bugfix with no observed behavior change for already-working code -
+confirmed via `TestHeadTailMaybeSemantics`.
 
 ## D8 — Reuse `calcium-lang`'s own stdlib `.ca` source instead of hand-porting (**decided**)
 

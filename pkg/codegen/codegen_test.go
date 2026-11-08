@@ -125,13 +125,30 @@ func TestBifNameCollisionCompiles(t *testing.T) {
 	}
 }
 
-// TestEffectFunctionCompilesWithoutWrapping documents the current D5
-// limitation: func! compiles exactly like func, with no automatic
-// success(...) wrapping.
-func TestEffectFunctionCompilesWithoutWrapping(t *testing.T) {
+// TestEffectFunctionWrapsResult covers D5 (closed): func! unconditionally
+// wraps its body in {ok, V} - confirmed against the real reference VM to
+// be genuinely unconditional (a func! wrapping a call that already
+// produces success/failure really does double-wrap: success(success(5))).
+func TestEffectFunctionWrapsResult(t *testing.T) {
 	out := compile(t, "func! identity(x) = x;")
-	if !strings.Contains(out, "'identity'(V_x) ->\n    V_x.") {
-		t.Errorf("expected unwrapped body:\n%s", out)
+	if !strings.Contains(out, "'identity'(V_x) ->\n    {ok, V_x}.") {
+		t.Errorf("expected the body wrapped in {ok, _}:\n%s", out)
+	}
+}
+
+// TestEffectFunctionWrappingPrimitiveCallIsNotDoubled is the exception to
+// the above: a func! whose body is a direct call to a native primitive or
+// stdlib function isn't double-wrapped, because that primitive already
+// returns its value in the shape the reference VM's primitive-call
+// machinery expects (raw on success, a Go-level failure handled specially -
+// not an ordinary Calcium success/failure flowing through). Confirmed
+// against the reference: io.write_file (func! wrapping __write_file, which
+// itself returns success(Maybe.None)/failure(err) in Go) actually prints
+// "success(Maybe.None)", not "success(success(Maybe.None))".
+func TestEffectFunctionWrappingPrimitiveCallIsNotDoubled(t *testing.T) {
+	out := compile(t, "func! identity(x) = len(x);")
+	if !strings.Contains(out, "'identity'(V_x) ->\n    calcium_builtins:len(V_x).") {
+		t.Errorf("expected the primitive call left unwrapped:\n%s", out)
 	}
 }
 
@@ -256,9 +273,12 @@ func TestStage2EndToEnd(t *testing.T) {
 		t.Skip("erl not found, skipping end-to-end BEAM compile check")
 	}
 
+	// Indexes with arr[0] rather than head(arr), matching how array.ca
+	// itself avoids head (head returns Maybe.Some/None - see D7 - arr[0]
+	// doesn't).
 	out := compile(t, `func sum_helper(arr, acc) = match len(arr)
     0 => acc
-    _ => sum_helper(tail(arr), acc + head(arr));
+    _ => sum_helper(tail(arr), acc + arr[0]);
 
 func sum(arr) = sum_helper(arr, 0);
 
@@ -439,6 +459,40 @@ func TestCalciumLangBytesCaEndToEnd(t *testing.T) {
 	// io:format's ~p prints a list of printable ASCII bytes as a quoted
 	// string ("AB"), not [65,66] - cosmetic, not a value difference.
 	if !strings.Contains(string(runOut), `"AB" [0,0,0,0,0,0,0,1]`) {
+		t.Errorf("unexpected output:\n%s", runOut)
+	}
+}
+
+// TestHeadTailMaybeSemantics covers D7 (closed): head returns
+// Maybe.Some(H)/Maybe.None (pkg/vm/vm.go's builtinHead), while tail
+// returns a raw empty array on empty input, never Maybe (builtinTail) -
+// confirmed these two differ from each other in the reference, not
+// assumed to match.
+func TestHeadTailMaybeSemantics(t *testing.T) {
+	erlc, err := exec.LookPath("erlc")
+	if err != nil {
+		t.Skip("erlc not found, skipping end-to-end BEAM compile check")
+	}
+	erl, err := exec.LookPath("erl")
+	if err != nil {
+		t.Skip("erl not found, skipping end-to-end BEAM compile check")
+	}
+
+	dir := t.TempDir()
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", "erl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(erlc, "-o", dir, filepath.Join(repoRoot, "calcium_builtins.erl")).CombinedOutput(); err != nil {
+		t.Fatalf("erlc failed: %v\n%s", err, out)
+	}
+
+	runOut, err := exec.Command(erl, "-noshell", "-pa", dir, "-eval",
+		`io:format("~p ~p ~p ~p~n", [calcium_builtins:head([1,2,3]), calcium_builtins:head([]), calcium_builtins:tail([1,2,3]), calcium_builtins:tail([])]), halt().`).CombinedOutput()
+	if err != nil {
+		t.Fatalf("erl run failed: %v\n%s", err, runOut)
+	}
+	if !strings.Contains(string(runOut), "{'Some',1} 'None' [2,3] []") {
 		t.Errorf("unexpected output:\n%s", runOut)
 	}
 }

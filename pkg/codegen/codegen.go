@@ -129,12 +129,6 @@ func (g *generator) statement(stmt ast.Statement) (string, error) {
 }
 
 func (g *generator) functionDecl(fd *ast.FunctionDeclaration) (string, error) {
-	// `func!` (effect functions) compile identically to `func` for now: the
-	// reference compiler additionally wraps a func! body's return value in
-	// success(...) unless it is already a Result, which needs the same
-	// success/failure representation decided for Stage 3's Result handling.
-	// Tracked as a known limitation, not yet a correctness issue for the
-	// programs stage 1/2 target. See docs/DECISIONS.md D5.
 	params := make([]string, len(fd.Parameters))
 	for i, p := range fd.Parameters {
 		params[i] = erlVar(p.Value)
@@ -145,7 +139,44 @@ func (g *generator) functionDecl(fd *ast.FunctionDeclaration) (string, error) {
 		return "", fmt.Errorf("codegen: in function %q: %w", fd.Name.Value, err)
 	}
 
+	// `func!` (D5): confirmed empirically against the reference VM that
+	// OpWrapSuccess at the end of an effect function's body is genuinely
+	// unconditional - wrapping a plain .ca function call that already
+	// returns success/failure really does double-wrap it
+	// (`success(success(5))`). The exception is a direct call to a native
+	// primitive or stdlib function (dispatched via builtinCalls/
+	// stdlibCalls): those return their value already unwrapped-or-failed
+	// (matching pkg/vm/primitives.go returning a raw value or a Go-level
+	// Failure that the VM's primitive-call machinery handles specially,
+	// not as an ordinary Calcium success/failure flowing through), so
+	// wrapping them once here already produces the one level of success(...)
+	// the reference actually shows (e.g. io.write_file -> "success(Maybe.None)",
+	// not "success(success(Maybe.None))").
+	if fd.IsEffect && !isDirectPrimitiveOrStdlibCall(fd.Body) {
+		body = fmt.Sprintf("{ok, %s}", body)
+	}
+
 	return fmt.Sprintf("%s(%s) ->\n    %s.", erlAtom(fd.Name.Value), strings.Join(params, ", "), body), nil
+}
+
+// isDirectPrimitiveOrStdlibCall reports whether e is a call whose target is
+// dispatched via builtinCalls or stdlibCalls - see the D5 comment above.
+func isDirectPrimitiveOrStdlibCall(e ast.Expression) bool {
+	call, ok := e.(*ast.CallExpression)
+	if !ok {
+		return false
+	}
+	switch f := call.Function.(type) {
+	case *ast.Identifier:
+		_, ok := builtinCalls[f.Value]
+		return ok
+	case *ast.MemberExpression:
+		if obj, ok := f.Object.(*ast.Identifier); ok {
+			_, ok := stdlibCalls[obj.Value+"."+f.Property.Value]
+			return ok
+		}
+	}
+	return false
 }
 
 func (g *generator) expr(e ast.Expression) (string, error) {
