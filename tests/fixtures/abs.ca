@@ -1,0 +1,5 @@
+func abs(n) = match n < 0
+    true => -n
+    _ => n;
+
+x = abs(-5);
