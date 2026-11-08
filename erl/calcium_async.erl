@@ -133,7 +133,7 @@ stay_loop(State) ->
             receive
                 {source_fired, SourceRef, Value} ->
                     case find_handler(SourceRef, Active) of
-                        {Ref, Callback} ->
+                        {_Ref, Callback} ->
                             erase(stay_signal),
                             Callback(Value),
                             case get(stay_signal) of
