@@ -338,3 +338,78 @@ at compile time, same reasoning as `get`/`index`'s runtime dispatch.
 
 `async_all.ca` now matches end-to-end, added to the differential corpus
 (7/9 now).
+
+## D15 — Plan item 4, phase 2: `async.stay`/`expects`/Handler/Task (**decided**)
+
+Implemented per the design in the session's plan (read `pkg/vm/vm.go`'s
+`executeStayBegin`/`runStayLoop`/`executeContinue`/`executeLeave`,
+`builtinAsyncExpects`/`Continue`/`Leave`/`Cancel`, `builtinScheduleTimeout`/
+`Interval`, and `OpGetMember`'s `TYPE_TASK`/`TYPE_HANDLER` cases directly
+before designing, not assumed from the opcode table):
+
+- **Handler = `{handler, Ref}`, Task = `{task, Ref}`**, both backed by a
+  shared ETS table (`calcium_handlers`/`calcium_tasks` in
+  `erl/calcium_async.erl`) holding mutable status/result - Erlang terms
+  are immutable, but `.pause()`/`.resume()`/`async.cancel` mutate a
+  Handler's status, and a Task's status/result must be queryable
+  (`task.status`, `task.result`) without consuming the `{task_result,
+  Ref, Result}` message `async.all` also needs.
+- **`person.name` (hash field), `handler.status`/`task.result` (property),
+  and `handler.ready()` (method)** all share Calcium's `.` syntax, same
+  as `get`/`index`/`add` before them - dispatched at runtime via
+  `calcium_builtins:prop/2`/`invoke/3`, which fall through to
+  `calcium_async` for a Handler/Task tuple and to `maps:get` for a hash.
+  `pkg/codegen`'s `call()` only takes this fallback for a method call
+  whose object *isn't* a known `core.*` module name
+  (`stdlibModuleObjects`, hand-listed rather than derived purely from
+  `stdlibCalls`'s current keys) - otherwise `os.exit(...)` with an
+  unimplemented function would silently become a runtime `invoke/3`
+  crash instead of the clear "not yet mapped" compile error D6
+  established.
+- **`async.stay(k: v, ...) { body }`** (`*ast.StayExpression` - real
+  special syntax, unlike most of `core.async`, see D14) compiles to an
+  immediately-invoked fun: build the initial state map, run the body
+  statements (whose only job is side-effecting `expects()`/`ready()`
+  calls), then call `calcium_async:stay_loop/1`. `executeStayEnd` wraps
+  the loop's result in `success(...)` *unconditionally* - not gated on
+  an effect-function check like D5's `func!` wrap - so `g.stay` applies
+  `{ok, ...}` directly rather than reusing `functionDecl`'s logic.
+- **`async.continue`/`async.leave`, called from inside an `expects()`
+  callback, signal back via the process dictionary** (`put(stay_signal,
+  ...)`before the callback returns, read by `stay_loop` after it
+  returns) - the reference achieves the equivalent by mutating
+  `vm.currentStay()`, ambient single-VM state with no Erlang analogue;
+  the process dictionary is the pragmatic equivalent for state scoped to
+  one callback-dispatch call, not promoted to a general pattern elsewhere.
+
+Verified end-to-end against the real examples, not just unit tests:
+`async_handler.ca` and `async_cancel.ca` (no `stay` at all - pure Handler
+lifecycle) match exactly. `async_timeout.ca` and `async_interval.ca`
+(full `stay`+`schedule.timeout`/`interval`+`expects`+`ready`+`leave`)
+also match exactly. `async_spawn.ca` matches on every line except one:
+right after spawning a trivial `() => 42` task, the reference's `task.status`
+reads `"pending"`, this implementation's reads `"completed"` - BEAM's
+scheduler runs a freshly spawned lightweight process fast enough that a
+trivial task is often done before the parent's very next instruction,
+where Go's goroutine scheduling usually hasn't gotten there yet. This is
+the example querying a task's status immediately after spawning it
+racing the task's own completion - inherently non-deterministic in
+*both* runtimes (the reference isn't guaranteed `"pending"` either, just
+usually), not a logic bug to chase by artificially slowing `spawn_`
+down. `async_handler.ca`/`async_cancel.ca`/`async_timeout.ca`/
+`async_interval.ca` are added to the differential corpus;
+`async_spawn.ca` is deliberately left out of it for this reason.
+
+### Known limitations (deliberate scope cuts, not oversights - see the plan)
+
+1. One active `stay` loop at a time - `stay_loop` reads every active
+   handler in the shared ETS table, not scoped to "this" stay block.
+2. No `OpStayGetState` equivalent - a stay-declared state variable isn't
+   readable inside the body or a callback (state is still threaded
+   correctly through `continue`, just not exposed to identifier lookup
+   yet). No current example reads one.
+3. A stay loop's exit condition checks only "no active handlers", not
+   the reference's "no active handlers *and* no pending tasks".
+4. `async.cancel` only handles a Handler, not a Task.
+5. `task.done` (an EventSource for `expects`/`stay`), stdin/EOF sources,
+   and channel-backed event sources aren't implemented.

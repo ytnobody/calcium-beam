@@ -32,6 +32,14 @@ var corpus = []string{
 	"adt.ca",
 	"pipeline.ca",
 	"async_all.ca",
+	"async_handler.ca",
+	"async_cancel.ca",
+	"async_timeout.ca",
+	"async_interval.ca",
+	// async_spawn.ca deliberately excluded - see docs/DECISIONS.md D15:
+	// it races task.status against the task's own completion, which is
+	// inherently non-deterministic in both this implementation and the
+	// reference, not a stable fixture for an exact-match corpus.
 }
 
 func TestCorpus(t *testing.T) {

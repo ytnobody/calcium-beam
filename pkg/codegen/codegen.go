@@ -239,6 +239,8 @@ func (g *generator) expr(e ast.Expression) (string, error) {
 		return g.pipe(n.Left, n.Right)
 	case *ast.EffectHandleExpression:
 		return g.effectHandle(n)
+	case *ast.StayExpression:
+		return g.stay(n)
 	case *ast.MemberExpression:
 		return g.stdlibValue(n)
 	case *ast.SuccessExpression:
@@ -329,6 +331,40 @@ func (g *generator) doExpr(n *ast.DoExpression) (string, error) {
 	}
 	stmts = append(stmts, final)
 	return fmt.Sprintf("(%s)", strings.Join(stmts, ", ")), nil
+}
+
+// stay renders `async.stay(k: v, ...) { body }` - special syntax in the
+// reference (OpStayBegin/OpStayEnd), not an ordinary call. The body's
+// statements run once for side effect (registering expects()/ready()
+// handlers), then calcium_async:stay_loop/1 runs the actual event loop -
+// see docs/DECISIONS.md D15 for this implementation's scope and known
+// limitations (one active stay at a time, no stay-state variable access
+// inside the body/callbacks yet, task list ignored in the exit
+// condition). executeStayEnd always wraps the loop's result in
+// success(...), unconditionally - not gated on IsEffect like D5's func!
+// wrap, so that wrap is applied directly here too.
+func (g *generator) stay(n *ast.StayExpression) (string, error) {
+	pairs := make([]string, len(n.StateInit))
+	for i, p := range n.StateInit {
+		val, err := g.expr(p.Value)
+		if err != nil {
+			return "", err
+		}
+		pairs[i] = fmt.Sprintf("%s => %s", erlBinaryString(p.Name.Value), val)
+	}
+
+	stmts := make([]string, 0, len(n.Body)+1)
+	for _, s := range n.Body {
+		src, err := g.statement(s)
+		if err != nil {
+			return "", err
+		}
+		stmts = append(stmts, src)
+	}
+	stmts = append(stmts, "calcium_async:stay_loop(InitialState)")
+
+	return fmt.Sprintf("{ok, (fun() -> InitialState = #{%s}, %s end)()}",
+		strings.Join(pairs, ", "), strings.Join(stmts, ", ")), nil
 }
 
 // pipe renders `x |> f` / `x |> f(y)` as `f(x)` / `f(x, y)` - the pipe
@@ -489,13 +525,29 @@ func (g *generator) call(n *ast.CallExpression) (string, error) {
 		}
 	}
 
-	// Type.Variant(...) - a type-qualified ADT constructor, e.g.
-	// Maybe.Some(5). See docs/DECISIONS.md D3: the type qualifier is
-	// informational only, so this constructs the same tagged tuple as the
-	// bare Variant(...) form.
 	if m, ok := n.Function.(*ast.MemberExpression); ok {
+		// Type.Variant(...) - a type-qualified ADT constructor, e.g.
+		// Maybe.Some(5). See docs/DECISIONS.md D3: the type qualifier is
+		// informational only, so this constructs the same tagged tuple as
+		// the bare Variant(...) form.
 		if obj, ok := m.Object.(*ast.Identifier); ok && isUpper(obj.Value) && isUpper(m.Property.Value) {
 			return adtTuple(m.Property.Value, args), nil
+		}
+		// A method call (`handler.ready()`) on a value whose shape isn't
+		// known until runtime - same reasoning as prop/invoke in
+		// stdlibValue, dispatched through calcium_builtins:invoke/3. Only
+		// reached when the object isn't a known stdlib module name
+		// (module.function calls are handled by stdlibTarget below via
+		// callTarget, before this would ever be considered); see
+		// docs/DECISIONS.md D15.
+		if obj, ok := m.Object.(*ast.Identifier); ok {
+			if _, isStdlibModule := stdlibModuleObjects[obj.Value]; !isStdlibModule {
+				objSrc, err := g.expr(m.Object)
+				if err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("calcium_builtins:invoke(%s, %s, [%s])", objSrc, erlBinaryString(m.Property.Value), strings.Join(args, ", ")), nil
+			}
 		}
 	}
 
@@ -567,15 +619,16 @@ func (g *generator) stdlibValue(m *ast.MemberExpression) (string, error) {
 	if obj, ok := m.Object.(*ast.Identifier); ok && isUpper(obj.Value) && isUpper(m.Property.Value) {
 		return adtTuple(m.Property.Value, nil), nil
 	}
-	// Dot-notation hash field access (`person.name` for a hash with key
-	// "name"), the only remaining meaning for `expr.ident` once the
-	// stdlib-call (callTarget's own MemberExpression branch) and ADT-value
-	// cases are ruled out.
+	// Dot-notation property access (`person.name` for a hash, or
+	// `handler.status`/`task.result` for a Handler/Task - D15), the only
+	// remaining meaning for `expr.ident` once the stdlib-module and
+	// ADT-value cases are ruled out. Dispatched at runtime via
+	// calcium_builtins:prop/2, same reasoning as invoke/3 in call().
 	obj, err := g.expr(m.Object)
 	if err != nil {
 		return "", fmt.Errorf("codegen: unsupported member expression %s.%s: %w", describeExpr(m.Object), m.Property.Value, err)
 	}
-	return fmt.Sprintf("maps:get(%s, %s)", erlBinaryString(m.Property.Value), obj), nil
+	return fmt.Sprintf("calcium_builtins:prop(%s, %s)", obj, erlBinaryString(m.Property.Value)), nil
 }
 
 func describeExpr(e ast.Expression) string {
@@ -611,11 +664,40 @@ var stdlibCalls = map[string]string{
 	"string.char_at":     "calcium_str_native:char_at",
 	"string.length":      "calcium_str_native:len",
 	"string.substring":   "calcium_str_native:substring",
-	// core.async's standalone-usable functions (D14) - async.stay/expects
-	// are a separate, larger effort.
-	"async.spawn": "calcium_async:spawn_",
-	"async.all":   "calcium_async:all_",
+	// core.async (D14/D15). async.stay itself is special syntax, handled
+	// by g.stay, not a stdlibCalls entry.
+	"async.spawn":    "calcium_async:spawn_",
+	"async.all":      "calcium_async:all_",
+	"async.expects":  "calcium_async:expects",
+	"async.continue": "calcium_async:continue",
+	"async.leave":    "calcium_async:leave",
+	"async.cancel":   "calcium_async:cancel",
+	// core.schedule (D14/D15).
+	"schedule.timeout":  "calcium_schedule:timeout_",
+	"schedule.interval": "calcium_schedule:interval_",
 }
+
+// stdlibModuleObjects is every core.* module name, not just the ones
+// stdlibCalls currently maps a function for - "os.exit(...)" must still
+// be the same clear "not yet mapped" compile error it always was (D6),
+// not silently fall through to the handler/task invoke/3 dispatch just
+// because this particular os.* function isn't implemented yet. Used to
+// tell `io.say(...)`/`async.expects(...)` apart from `handler.ready()`/
+// `person.name` (a method/property access on an arbitrary value,
+// dispatched at runtime - D15) when both share Calcium's `.` syntax.
+var stdlibModuleObjects = func() map[string]struct{} {
+	m := map[string]struct{}{
+		"io": {}, "string": {}, "array": {}, "math": {}, "bytes": {},
+		"os": {}, "async": {}, "schedule": {}, "time": {}, "regex": {},
+		"toml": {}, "http": {}, "assert": {}, "json": {}, "dbi": {},
+	}
+	for key := range stdlibCalls {
+		if dot := strings.IndexByte(key, '.'); dot >= 0 {
+			m[key[:dot]] = struct{}{}
+		}
+	}
+	return m
+}()
 
 // builtinCalls maps a global built-in function name (no module qualifier) to
 // its erl/ implementation. See erl/calcium_builtins.erl and
