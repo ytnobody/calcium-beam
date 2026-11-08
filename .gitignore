@@ -1,3 +1,6 @@
-*.erl
+# Generated Erlang output from calciumbeam (compiler-emitted, not erl/'s
+# tracked support-library source).
+/*.erl
+/tests/**/*.erl
 *.beam
 /calciumbeam

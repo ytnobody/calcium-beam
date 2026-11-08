@@ -41,6 +41,16 @@ func (g *generator) renderModule(program *ast.Program) (string, error) {
 			}
 			funcs = append(funcs, src)
 			exports = append(exports, fmt.Sprintf("%s/%d", erlAtom(s.Name.Value), len(s.Parameters)))
+		case *ast.UseStatement:
+			// Module imports have no runtime effect in generated code: stdlib
+			// calls (io.say, ...) are dispatched by name in call(), regardless
+			// of whether/how they were imported. See docs/DECISIONS.md D5.
+			continue
+		case *ast.TypeDeclaration:
+			// ADT variants need no declaration in Erlang - a constructor call
+			// or pattern is just a tagged tuple, built/matched by name. See
+			// docs/DECISIONS.md D3.
+			continue
 		default:
 			src, err := g.statement(stmt)
 			if err != nil {
@@ -96,10 +106,12 @@ func (g *generator) statement(stmt ast.Statement) (string, error) {
 }
 
 func (g *generator) functionDecl(fd *ast.FunctionDeclaration) (string, error) {
-	if fd.IsEffect {
-		return "", fmt.Errorf("codegen: func! (effect functions) is a later stage, got %q", fd.Name.Value)
-	}
-
+	// `func!` (effect functions) compile identically to `func` for now: the
+	// reference compiler additionally wraps a func! body's return value in
+	// success(...) unless it is already a Result, which needs the same
+	// success/failure representation decided for Stage 3's Result handling.
+	// Tracked as a known limitation, not yet a correctness issue for the
+	// programs stage 1/2 target. See docs/DECISIONS.md D5.
 	params := make([]string, len(fd.Parameters))
 	for i, p := range fd.Parameters {
 		params[i] = erlVar(p.Value)
@@ -133,9 +145,168 @@ func (g *generator) expr(e ast.Expression) (string, error) {
 		return g.call(n)
 	case *ast.MatchExpression:
 		return g.match(n)
+	case *ast.ArrayLiteral:
+		return g.arrayLiteral(n)
+	case *ast.TupleLiteral:
+		return g.tupleLiteral(n)
+	case *ast.HashLiteral:
+		return g.hashLiteral(n)
+	case *ast.IndexExpression:
+		return g.index(n)
+	case *ast.DoExpression:
+		return g.doExpr(n)
+	case *ast.PipeExpression:
+		return g.pipe(n.Left, n.Right)
+	case *ast.EffectPipeExpression:
+		// Treated identically to `|>` for now - see the func! note in
+		// functionDecl and docs/DECISIONS.md D5 for the deferred
+		// success/failure wrapping this skips.
+		return g.pipe(n.Left, n.Right)
+	case *ast.EffectHandleExpression:
+		return g.effectHandle(n)
+	case *ast.MemberExpression:
+		return g.stdlibValue(n)
+	case *ast.SuccessExpression:
+		v, err := g.expr(n.Value)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("{ok, %s}", v), nil
+	case *ast.FailureExpression:
+		v, err := g.expr(n.Value)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("{error, %s}", v), nil
 	default:
 		return "", fmt.Errorf("codegen: unsupported expression %T (later stage)", e)
 	}
+}
+
+func (g *generator) arrayLiteral(n *ast.ArrayLiteral) (string, error) {
+	elems, err := g.exprList(n.Elements)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("[%s]", strings.Join(elems, ", ")), nil
+}
+
+func (g *generator) tupleLiteral(n *ast.TupleLiteral) (string, error) {
+	elems, err := g.exprList(n.Elements)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("{%s}", strings.Join(elems, ", ")), nil
+}
+
+// hashLiteral renders a Calcium hash as an Erlang map. The reference parser
+// (parseHashPair) already rewrites a bare-identifier key (`{name: ...}`)
+// into a *ast.StringLiteral, so every key here is an ordinary expression.
+func (g *generator) hashLiteral(n *ast.HashLiteral) (string, error) {
+	pairs := make([]string, len(n.Pairs))
+	for i, p := range n.Pairs {
+		key, err := g.expr(p.Key)
+		if err != nil {
+			return "", err
+		}
+		val, err := g.expr(p.Value)
+		if err != nil {
+			return "", err
+		}
+		pairs[i] = fmt.Sprintf("%s => %s", key, val)
+	}
+	return fmt.Sprintf("#{%s}", strings.Join(pairs, ", ")), nil
+}
+
+func (g *generator) index(n *ast.IndexExpression) (string, error) {
+	left, err := g.expr(n.Left)
+	if err != nil {
+		return "", err
+	}
+	idx, err := g.expr(n.Index)
+	if err != nil {
+		return "", err
+	}
+	// Calcium arrays are 0-indexed lists; Erlang's lists:nth/2 is 1-indexed.
+	return fmt.Sprintf("lists:nth((%s) + 1, %s)", idx, left), nil
+}
+
+// doExpr renders a do...end block. Erlang's comma-separated expression
+// sequence already evaluates to its last member, so this needs no special
+// control-flow construct - just the same statement rendering main/0 uses.
+func (g *generator) doExpr(n *ast.DoExpression) (string, error) {
+	stmts := make([]string, 0, len(n.Statements)+1)
+	for _, s := range n.Statements {
+		src, err := g.statement(s)
+		if err != nil {
+			return "", err
+		}
+		stmts = append(stmts, src)
+	}
+	final, err := g.expr(n.FinalExpression)
+	if err != nil {
+		return "", err
+	}
+	stmts = append(stmts, final)
+	return fmt.Sprintf("(%s)", strings.Join(stmts, ", ")), nil
+}
+
+// pipe renders `x |> f` / `x |> f(y)` as `f(x)` / `f(x, y)` - the pipe
+// input becomes the first argument, matching the reference compiler's
+// desugaring in pkg/compiler/compiler.go.
+func (g *generator) pipe(left, right ast.Expression) (string, error) {
+	leftSrc, err := g.expr(left)
+	if err != nil {
+		return "", err
+	}
+	if call, ok := right.(*ast.CallExpression); ok {
+		fnSrc, err := g.callTarget(call.Function)
+		if err != nil {
+			return "", err
+		}
+		args, err := g.exprList(call.Arguments)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s(%s)", fnSrc, strings.Join(append([]string{leftSrc}, args...), ", ")), nil
+	}
+	fnSrc, err := g.callTarget(right)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s(%s)", fnSrc, leftSrc), nil
+}
+
+// effectHandle renders `subject !? { success(v) => ... failure(e) => ... }`
+// as an Erlang case over the {ok, V} / {error, E} representation decided in
+// docs/DECISIONS.md D3.
+func (g *generator) effectHandle(n *ast.EffectHandleExpression) (string, error) {
+	subject, err := g.expr(n.Subject)
+	if err != nil {
+		return "", err
+	}
+	successBody, err := g.expr(n.SuccessBody)
+	if err != nil {
+		return "", err
+	}
+	failureBody, err := g.expr(n.FailureBody)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("case %s of\n        {ok, %s} -> %s;\n        {error, %s} -> %s\n    end",
+		subject, erlVar(n.SuccessVar.Value), successBody, erlVar(n.FailureVar.Value), failureBody), nil
+}
+
+func (g *generator) exprList(exprs []ast.Expression) ([]string, error) {
+	out := make([]string, len(exprs))
+	for i, e := range exprs {
+		src, err := g.expr(e)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = src
+	}
+	return out, nil
 }
 
 func (g *generator) infix(n *ast.InfixExpression) (string, error) {
@@ -183,19 +354,128 @@ func (g *generator) prefix(n *ast.PrefixExpression) (string, error) {
 }
 
 func (g *generator) call(n *ast.CallExpression) (string, error) {
-	fn, ok := n.Function.(*ast.Identifier)
-	if !ok {
-		return "", fmt.Errorf("codegen: only direct named calls are supported in stage 1, got %T", n.Function)
+	args, err := g.exprList(n.Arguments)
+	if err != nil {
+		return "", err
 	}
-	args := make([]string, len(n.Arguments))
-	for i, a := range n.Arguments {
-		arg, err := g.expr(a)
-		if err != nil {
-			return "", err
+
+	if ident, ok := n.Function.(*ast.Identifier); ok {
+		// A capitalized name in call position is an ADT constructor, not a
+		// function - Calcium functions are lowercase by convention. See
+		// docs/DECISIONS.md D3: ADT variants are tagged tuples.
+		if isUpper(ident.Value) {
+			return adtTuple(ident.Value, args), nil
 		}
-		args[i] = arg
+		// A global built-in (len, head, tail, to_string, ...) is implemented
+		// in erl/calcium_builtins.erl rather than compiled as a Calcium
+		// function, since there's no corresponding func declaration to walk.
+		if target, ok := builtinCalls[ident.Value]; ok {
+			return fmt.Sprintf("%s(%s)", target, strings.Join(args, ", ")), nil
+		}
 	}
-	return fmt.Sprintf("%s(%s)", erlAtom(fn.Value), strings.Join(args, ", ")), nil
+
+	// Type.Variant(...) - a type-qualified ADT constructor, e.g.
+	// Maybe.Some(5). See docs/DECISIONS.md D3: the type qualifier is
+	// informational only, so this constructs the same tagged tuple as the
+	// bare Variant(...) form.
+	if m, ok := n.Function.(*ast.MemberExpression); ok {
+		if obj, ok := m.Object.(*ast.Identifier); ok && isUpper(obj.Value) && isUpper(m.Property.Value) {
+			return adtTuple(m.Property.Value, args), nil
+		}
+	}
+
+	fnSrc, err := g.callTarget(n.Function)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s(%s)", fnSrc, strings.Join(args, ", ")), nil
+}
+
+// callTarget renders the callable part of a call expression (everything
+// before the argument list): a direct Calcium function name, or a
+// module-qualified stdlib call dispatched by name (docs/DECISIONS.md D6).
+func (g *generator) callTarget(fn ast.Expression) (string, error) {
+	switch f := fn.(type) {
+	case *ast.Identifier:
+		return erlAtom(f.Value), nil
+	case *ast.MemberExpression:
+		return g.stdlibTarget(f)
+	default:
+		return "", fmt.Errorf("codegen: unsupported call target %T", fn)
+	}
+}
+
+// stdlibTarget resolves a `module.function` call target to the Erlang
+// module:function it's implemented by in erl/. Unknown module.function pairs
+// are a hard error naming both parts, since silently misrouting a stdlib
+// call would be a worse failure mode than refusing to compile it.
+func (g *generator) stdlibTarget(m *ast.MemberExpression) (string, error) {
+	obj, ok := m.Object.(*ast.Identifier)
+	if !ok {
+		return "", fmt.Errorf("codegen: unsupported member call target %T", m.Object)
+	}
+	key := obj.Value + "." + m.Property.Value
+	target, ok := stdlibCalls[key]
+	if !ok {
+		return "", fmt.Errorf("codegen: %s is not yet mapped to an erl/ implementation (later stage)", key)
+	}
+	return target, nil
+}
+
+// stdlibValue resolves a `module.member` expression used as a plain value
+// rather than a call target - currently only qualified ADT constructors used
+// without arguments (e.g. `Maybe.None`).
+func (g *generator) stdlibValue(m *ast.MemberExpression) (string, error) {
+	obj, ok := m.Object.(*ast.Identifier)
+	if ok && isUpper(obj.Value) && isUpper(m.Property.Value) {
+		return adtTuple(m.Property.Value, nil), nil
+	}
+	return "", fmt.Errorf("codegen: unsupported member expression %s.%s (later stage)", describeExpr(m.Object), m.Property.Value)
+}
+
+func describeExpr(e ast.Expression) string {
+	if id, ok := e.(*ast.Identifier); ok {
+		return id.Value
+	}
+	return fmt.Sprintf("%T", e)
+}
+
+// stdlibCalls maps `module.function` to its erl/ implementation. Populated
+// incrementally as stages add stdlib coverage; see erl/calcium_io.erl.
+var stdlibCalls = map[string]string{
+	"io.say":     "calcium_io:say",
+	"io.println": "calcium_io:say",
+	"io.print":   "calcium_io:print",
+}
+
+// builtinCalls maps a global built-in function name (no module qualifier) to
+// its erl/ implementation. See erl/calcium_builtins.erl and
+// docs/DECISIONS.md D7 for the head/tail/Maybe limitation.
+var builtinCalls = map[string]string{
+	"len":       "calcium_builtins:len",
+	"head":      "calcium_builtins:head",
+	"tail":      "calcium_builtins:tail",
+	"to_string": "calcium_builtins:to_string",
+}
+
+// isUpper reports whether a Calcium identifier is capitalized, the
+// convention this project uses (matching calcium-lang's own grammar rule for
+// constructor patterns) to tell an ADT variant/type name apart from a
+// function or variable name without needing the type declaration in scope.
+func isUpper(s string) bool {
+	return s != "" && s[0] >= 'A' && s[0] <= 'Z'
+}
+
+// adtTuple renders an ADT constructor call/value as a tagged tuple. The tag
+// is always the bare variant name (not type-qualified), so both `Some(x)`
+// and `Maybe.Some(x)` construct/match the same representation - mirroring
+// calcium-lang PR #185's bare-or-qualified pattern matching.
+func adtTuple(variant string, args []string) string {
+	tag := "'" + variant + "'"
+	if len(args) == 0 {
+		return tag
+	}
+	return fmt.Sprintf("{%s, %s}", tag, strings.Join(args, ", "))
 }
 
 // match renders a Calcium match expression as an Erlang case expression.
@@ -249,6 +529,8 @@ func (g *generator) pattern(p ast.Expression, isDefault bool) (string, error) {
 		return "_", nil
 	}
 	switch n := p.(type) {
+	case *ast.WildcardExpression:
+		return "_", nil
 	case *ast.Identifier:
 		return erlVar(n.Value), nil
 	case *ast.IntegerLiteral, *ast.FloatLiteral, *ast.BooleanLiteral, *ast.StringLiteral:
@@ -256,9 +538,55 @@ func (g *generator) pattern(p ast.Expression, isDefault bool) (string, error) {
 	case *ast.PrefixExpression:
 		// A negative numeric literal pattern, e.g. `-1 => ...`.
 		return g.expr(p)
+	case *ast.ConstructorPattern:
+		return g.constructorPattern(n)
+	case *ast.ArrayLiteral:
+		elems := make([]string, len(n.Elements))
+		for i, el := range n.Elements {
+			src, err := g.pattern(el, isWildcard(el))
+			if err != nil {
+				return "", err
+			}
+			elems[i] = src
+		}
+		return fmt.Sprintf("[%s]", strings.Join(elems, ", ")), nil
+	case *ast.TupleLiteral:
+		elems := make([]string, len(n.Elements))
+		for i, el := range n.Elements {
+			src, err := g.pattern(el, isWildcard(el))
+			if err != nil {
+				return "", err
+			}
+			elems[i] = src
+		}
+		return fmt.Sprintf("{%s}", strings.Join(elems, ", ")), nil
 	default:
-		return "", fmt.Errorf("codegen: unsupported match pattern %T (constructor/ADT patterns are a later stage)", p)
+		return "", fmt.Errorf("codegen: unsupported match pattern %T (later stage)", p)
 	}
+}
+
+// constructorPattern renders `Variant(f1, f2, ...)` as the tagged-tuple
+// pattern matching adtTuple's construction. Fields are restricted by the
+// reference parser (parsePatternAtom) to a binding, wildcard, or literal, so
+// pattern() handles every case already.
+func (g *generator) constructorPattern(cp *ast.ConstructorPattern) (string, error) {
+	fields := make([]string, len(cp.Fields))
+	for i, f := range cp.Fields {
+		src, err := g.pattern(f, isWildcard(f))
+		if err != nil {
+			return "", err
+		}
+		fields[i] = src
+	}
+	if len(fields) == 0 {
+		return fmt.Sprintf("'%s'", cp.Name), nil
+	}
+	return fmt.Sprintf("{'%s', %s}", cp.Name, strings.Join(fields, ", ")), nil
+}
+
+func isWildcard(e ast.Expression) bool {
+	_, ok := e.(*ast.WildcardExpression)
+	return ok
 }
 
 // erlAtom lowercases and sanitizes a Calcium identifier for use as an Erlang

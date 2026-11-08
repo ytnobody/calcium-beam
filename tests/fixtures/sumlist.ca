@@ -1,0 +1,17 @@
+use core.io!;
+
+type Tree = Leaf(value) | Node(left, right);
+
+func tree_sum(t) = match t
+    Leaf(v) => v
+    Node(l, r) => tree_sum(l) + tree_sum(r);
+
+func sum_helper(arr, acc) = match len(arr)
+    0 => acc
+    _ => sum_helper(tail(arr), acc + head(arr));
+
+func sum(arr) = sum_helper(arr, 0);
+
+t = Node(Leaf(1), Node(Leaf(2), Leaf(3)));
+"tree sum" !> io.say;
+to_string(tree_sum(t)) !> io.say;

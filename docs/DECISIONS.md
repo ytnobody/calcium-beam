@@ -40,13 +40,52 @@ and timers — there is no second scheduler to nest.
 `TYPE_EVENT_SOURCE` → a `pid()`/timer ref, `TYPE_SECRET*` → an opaque wrapped
 term not inspectable by ordinary pattern matching. Everything else is a
 native Erlang term: `success`/`failure` → `{ok, V}`/`{error, E}`, ADTs →
-tagged tuples keyed by the qualified tag atom (so both bare and
-`Type.Variant`-qualified patterns resolve, matching `calcium-lang` PR #185),
-arrays/tuples/hashes/strings → list/tuple/map/binary.
+tagged tuples keyed by the **bare** variant name as the tag atom
+(`Some(x)` and `Maybe.Some(x)` both construct/match `{'Some', X}`) - a type
+qualifier is informational only and never affects the runtime tag, so both
+bare and `Type.Variant`-qualified constructors/patterns resolve identically
+without needing the type declaration in scope, matching the outcome of
+`calcium-lang` PR #185's dual-form matching. Arrays → Erlang lists, tuples →
+Erlang tuples, hashes → Erlang maps, strings → UTF-8 binaries.
 
-## D4 — Erlang/OTP is a hard local + CI prerequisite (**open**, tracked)
+## D4 — Erlang/OTP local + CI prerequisite (**resolved**)
 
-No `erlc` in the primary dev environment as of this writing; install is
-in progress. CI (`.github/workflows/ci.yml`) will need an Erlang/OTP-enabled
-runner image before Stage 1 can be verified end-to-end, not just codegen
-unit-tested.
+Installed locally; `pkg/codegen`'s end-to-end test
+(`TestBifNameCollisionCompiles`) invokes the real `erlc` when present on
+`PATH` and skips otherwise. `.github/workflows/ci.yml` installs OTP via
+`erlef/setup-beam`.
+
+## D5 — `func!` and `!>` don't yet wrap in `success`/`failure` (**open**, tracked)
+
+The reference compiler wraps a `func!` body's return value in `success(...)`
+automatically unless the body already produced a Result (`pkg/compiler/compiler.go`
+around the `hasConstraints`/`node.IsEffect` check). `calcium-beam` currently
+compiles `func!` identically to `func` - no automatic wrap - so an effect
+function's result isn't yet a `{ok, _}` unless its body says so explicitly.
+`!>`/`!!!>` (`EffectPipeExpression`) are likewise compiled exactly like `|>`
+for now. Not a correctness problem for the programs Stage 1/2 target (none
+rely on implicit effect wrapping yet), but must be resolved before Stage 3
+claims effect support.
+
+## D6 — stdlib calls are dispatched by `module.function` name, not by resolving `use` (**decided**)
+
+A `use core.io!;` statement has no runtime effect in generated code
+(`renderModule` skips `*ast.UseStatement` outright). Instead,
+`stdlibCalls` in `pkg/codegen/codegen.go` is a fixed table mapping
+`module.function` strings to their `erl/` implementation
+(`io.say` → `calcium_io:say`, see `erl/calcium_io.erl`), checked at the call
+site. This avoids implementing Calcium's module resolution/search path for
+something that, in `calcium-beam`, is always a fixed, finite set of
+standard-library modules - there is no third-party `.ca` module loading to
+support here, unlike the reference VM. An unmapped `module.function` is a
+hard compile error naming both parts, not a silent miscompile.
+
+## D7 — `head`/`tail` don't yet return `Maybe` (**open**, tracked)
+
+The reference implementation's `head(array)` returns `Maybe.Some(value)` /
+`Maybe.None` (see `calcium-lang`'s `Null` → `Maybe` breaking change), and
+`tail` on an empty array is presumably similarly guarded. `erl/calcium_builtins.erl`'s
+`head/1`/`tail/1` currently pattern-match `[H|_]`/`[_|T]` directly and crash
+on an empty list instead. Acceptable for Stage 2 fixtures (none call `head`/`tail`
+on an empty array), but must be fixed - wrapping in `{ok, 'Some', V}`/`'None'`
+per D3's tagged-tuple convention - before claiming general array stdlib support.
