@@ -2,4 +2,11 @@ module github.com/ytnobody/calcium-beam
 
 go 1.26.0
 
-require github.com/ytnobody/calcium-lang v0.2.35 // indirect
+require (
+	github.com/BurntSushi/toml v1.6.0 // indirect
+	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
+	github.com/mattn/go-runewidth v0.0.31 // indirect
+	github.com/peterh/liner v1.2.3 // indirect
+	github.com/ytnobody/calcium-lang v0.2.35 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+)

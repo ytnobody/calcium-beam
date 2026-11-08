@@ -1,2 +1,12 @@
+github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk=
+github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
+github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJv2v7Vk=
+github.com/clipperhouse/uax29/v2 v2.7.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
+github.com/mattn/go-runewidth v0.0.31 h1:1oCV4ReTlosDBc6rYRw5cL8S/4y8iv5oRl4SJ5IBgwo=
+github.com/mattn/go-runewidth v0.0.31/go.mod h1:3qAiGCV4Koz/yuveO58qUefmUTRm8r0IGEXZ9jeHp/8=
+github.com/peterh/liner v1.2.3 h1:JF4G03iaZjtPyJE7gdOk76/fvs4OObMJWQHwR3wphxE=
+github.com/peterh/liner v1.2.3/go.mod h1:IC6gIBWLzuPGXmiX/86/ieO9K+9ITsaE6SKm1XkU9uw=
 github.com/ytnobody/calcium-lang v0.2.35 h1:A9+GVY8lDRghGED6bEqfktqzMG9CF9LJcHkx2gRvVNw=
 github.com/ytnobody/calcium-lang v0.2.35/go.mod h1:+PyT35PuEyWXHUGPvUZyFCmkkPNzf+ea/MfzuRCsNzU=
+golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
+golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

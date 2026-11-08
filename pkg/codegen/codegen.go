@@ -96,6 +96,13 @@ func (g *generator) renderModule(program *ast.Program) (string, error) {
 	fmt.Fprintf(&b, "-export([%s]).\n\n", strings.Join(exports, ", "))
 
 	fmt.Fprintf(&b, "main() ->\n")
+	// erl -noshell's standard_io defaults to an encoding that can't
+	// represent most non-ASCII code points, so io:format's ~ts falls back
+	// to an escaped \x{...} representation instead of printing them -
+	// confirmed by testing directly against erl, not assumed. Go's stdout
+	// has no such restriction, so without this every non-ASCII string
+	// literal would print differently than the reference.
+	b.WriteString("    io:setopts(standard_io, [{encoding, unicode}]),\n")
 	if len(mainStmts) == 0 {
 		b.WriteString("    ok.\n\n")
 	} else {
@@ -197,6 +204,13 @@ func (g *generator) expr(e ast.Expression) (string, error) {
 		if arity, ok := g.globals[n.Value]; ok {
 			return fmt.Sprintf("fun %s/%d", erlAtom(n.Value), arity), nil
 		}
+		// A bare capitalized name is a zero-argument ADT variant used as a
+		// value (e.g. `None` in `type Maybe = Some(value) | None;`) -
+		// Calcium function/variable names are lowercase by convention, so
+		// this can't be either of those. See docs/DECISIONS.md D3.
+		if isUpper(n.Value) {
+			return adtTuple(n.Value, nil), nil
+		}
 		return erlVar(n.Value), nil
 	case *ast.InfixExpression:
 		return g.infix(n)
@@ -290,8 +304,11 @@ func (g *generator) index(n *ast.IndexExpression) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Calcium arrays are 0-indexed lists; Erlang's lists:nth/2 is 1-indexed.
-	return fmt.Sprintf("lists:nth((%s) + 1, %s)", idx, left), nil
+	// `arr[i]` and `hash[key]` share this syntax in Calcium but need
+	// different Erlang operations (0-indexed lists vs maps); which one
+	// Left is isn't always known at compile time, so dispatch at runtime
+	// the same way calcium_builtins:get/2 already does.
+	return fmt.Sprintf("calcium_builtins:index(%s, %s)", left, idx), nil
 }
 
 // doExpr renders a do...end block. Erlang's comma-separated expression
@@ -442,6 +459,19 @@ func (g *generator) call(n *ast.CallExpression) (string, error) {
 		if isUpper(ident.Value) {
 			return adtTuple(ident.Value, args), nil
 		}
+		// concat is variadic in Calcium (concat(a, b, c, ...)), but
+		// calcium_builtins:concat/2 is the only arity that exists - Erlang
+		// has no variadic functions. Fold 3+ arguments into nested
+		// 2-argument calls at compile time instead of adding concat/3,
+		// concat/4, ... by hand; concatenation is associative, so the
+		// fold order doesn't affect the result.
+		if ident.Value == "concat" && len(args) > 2 {
+			acc := args[0]
+			for _, a := range args[1:] {
+				acc = fmt.Sprintf("calcium_builtins:concat(%s, %s)", acc, a)
+			}
+			return acc, nil
+		}
 		// A global built-in (len, head, tail, to_string, ...) is implemented
 		// in erl/calcium_builtins.erl rather than compiled as a Calcium
 		// function, since there's no corresponding func declaration to walk.
@@ -488,6 +518,17 @@ func (g *generator) callTarget(fn ast.Expression) (string, error) {
 		return erlVar(f.Value), nil
 	case *ast.MemberExpression:
 		return g.stdlibTarget(f)
+	case *ast.LambdaExpression:
+		// A lambda used directly as a pipe/call target, e.g.
+		// `n |> (r => concat(...))` - render as an immediately-callable
+		// fun expression; the caller appends "(Args)", and an immediately
+		// invoked fun needs its own parens in Erlang (`(fun(X) -> ... end)(Args)`,
+		// not `fun(X) -> ... end(Args)`).
+		lam, err := g.lambda(f)
+		if err != nil {
+			return "", err
+		}
+		return "(" + lam + ")", nil
 	default:
 		return "", fmt.Errorf("codegen: unsupported call target %T", fn)
 	}
@@ -514,11 +555,18 @@ func (g *generator) stdlibTarget(m *ast.MemberExpression) (string, error) {
 // rather than a call target - currently only qualified ADT constructors used
 // without arguments (e.g. `Maybe.None`).
 func (g *generator) stdlibValue(m *ast.MemberExpression) (string, error) {
-	obj, ok := m.Object.(*ast.Identifier)
-	if ok && isUpper(obj.Value) && isUpper(m.Property.Value) {
+	if obj, ok := m.Object.(*ast.Identifier); ok && isUpper(obj.Value) && isUpper(m.Property.Value) {
 		return adtTuple(m.Property.Value, nil), nil
 	}
-	return "", fmt.Errorf("codegen: unsupported member expression %s.%s (later stage)", describeExpr(m.Object), m.Property.Value)
+	// Dot-notation hash field access (`person.name` for a hash with key
+	// "name"), the only remaining meaning for `expr.ident` once the
+	// stdlib-call (callTarget's own MemberExpression branch) and ADT-value
+	// cases are ruled out.
+	obj, err := g.expr(m.Object)
+	if err != nil {
+		return "", fmt.Errorf("codegen: unsupported member expression %s.%s: %w", describeExpr(m.Object), m.Property.Value, err)
+	}
+	return fmt.Sprintf("maps:get(%s, %s)", erlBinaryString(m.Property.Value), obj), nil
 }
 
 func describeExpr(e ast.Expression) string {
@@ -534,6 +582,26 @@ var stdlibCalls = map[string]string{
 	"io.say":     "calcium_io_native:say",
 	"io.println": "calcium_io_native:say",
 	"io.print":   "calcium_io_native:print",
+	// core.string's thin wrappers (func trim(s) = __str_trim(s); etc.) are
+	// 1:1 passthroughs to the native primitives already in
+	// erl/calcium_str_native.erl, so a `use core.string;`-qualified call
+	// (`string.trim(...)`) can go straight there without first compiling
+	// string.ca's own source (unlike array.* - see docs/DECISIONS.md).
+	"string.trim":        "calcium_str_native:trim",
+	"string.upper":       "calcium_str_native:upper",
+	"string.to_upper":    "calcium_str_native:upper",
+	"string.lower":       "calcium_str_native:lower",
+	"string.to_lower":    "calcium_str_native:lower",
+	"string.split":       "calcium_str_native:split",
+	"string.join":        "calcium_str_native:join",
+	"string.replace":     "calcium_str_native:replace",
+	"string.contains":    "calcium_str_native:contains",
+	"string.starts_with": "calcium_str_native:starts_with",
+	"string.ends_with":   "calcium_str_native:ends_with",
+	"string.index_of":    "calcium_str_native:index_of",
+	"string.char_at":     "calcium_str_native:char_at",
+	"string.length":      "calcium_str_native:len",
+	"string.substring":   "calcium_str_native:substring",
 }
 
 // builtinCalls maps a global built-in function name (no module qualifier) to
@@ -551,6 +619,8 @@ var builtinCalls = map[string]string{
 	"push":      "calcium_builtins:push",
 	"range":     "calcium_builtins:range",
 	"get":       "calcium_builtins:get",
+	"keys":      "calcium_builtins:keys",
+	"values":    "calcium_builtins:values",
 	// core.math's native primitives (math.ca calls these directly by name,
 	// not as module.function - see docs/DECISIONS.md D8). Delegates
 	// straight to Erlang's math module.
@@ -692,8 +762,14 @@ func (g *generator) matchPatternAndGuard(c *ast.MatchCase, subjectVar string) (p
 // representation via pattern(), as opposed to needing the equality-guard
 // fallback in matchPatternAndGuard.
 func isSimplePattern(p ast.Expression) bool {
-	switch p.(type) {
-	case *ast.WildcardExpression, *ast.Identifier,
+	switch n := p.(type) {
+	case *ast.Identifier:
+		// A bare capitalized name is a zero-argument ADT tag to compare
+		// against, not a binding (`None` in `type Maybe = Some(v) | None;`)
+		// - it needs the equality-guard fallback below, same as any other
+		// non-pattern expression, not pattern()'s binding treatment.
+		return !isUpper(n.Value)
+	case *ast.WildcardExpression,
 		*ast.IntegerLiteral, *ast.FloatLiteral, *ast.BooleanLiteral, *ast.StringLiteral,
 		*ast.PrefixExpression, *ast.ConstructorPattern, *ast.ArrayLiteral, *ast.TupleLiteral:
 		return true
@@ -713,6 +789,12 @@ func (g *generator) pattern(p ast.Expression, isDefault bool) (string, error) {
 	case *ast.WildcardExpression:
 		return "_", nil
 	case *ast.Identifier:
+		// A bare capitalized name nested inside an array/tuple/constructor
+		// pattern is a zero-arg ADT tag to match, not a binding - same
+		// reasoning as isSimplePattern's top-level check.
+		if isUpper(n.Value) {
+			return fmt.Sprintf("'%s'", n.Value), nil
+		}
 		return erlVar(n.Value), nil
 	case *ast.IntegerLiteral, *ast.FloatLiteral, *ast.BooleanLiteral, *ast.StringLiteral:
 		return g.expr(p)
@@ -803,11 +885,17 @@ func erlBinaryString(s string) string {
 	var b strings.Builder
 	b.WriteString(`<<"`)
 	for _, r := range s {
-		switch r {
-		case '"':
+		switch {
+		case r == '"':
 			b.WriteString(`\"`)
-		case '\\':
+		case r == '\\':
 			b.WriteString(`\\`)
+		case r > 127:
+			// Escape rather than write the raw rune: whether erlc reads
+			// the generated .erl source itself as UTF-8 or Latin-1 isn't
+			// something to depend on for correctness, and \x{...} is
+			// unambiguous either way.
+			fmt.Fprintf(&b, `\x{%x}`, r)
 		default:
 			b.WriteRune(r)
 		}

@@ -4,21 +4,15 @@
 -module(calcium_io_native).
 -export([say/1, print/1]).
 
-%% io.say/io.println both print a value followed by a newline.
+%% io.say/io.println both print a value followed by a newline. Values are
+%% rendered with calcium_builtins:to_string, same as a Calcium program
+%% calling to_string explicitly - a value isn't printed any differently
+%% depending on whether it went through io.say or to_string first.
 say(Value) ->
-    io:format("~ts~n", [to_display(Value)]),
+    io:format("~ts~n", [calcium_builtins:to_string(Value)]),
     {ok, 'None'}.
 
 %% io.print prints a value with no trailing newline.
 print(Value) ->
-    io:format("~ts", [to_display(Value)]),
+    io:format("~ts", [calcium_builtins:to_string(Value)]),
     {ok, 'None'}.
-
-%% to_display renders a Calcium value the way to_string would. Binaries
-%% (Calcium strings) print verbatim; everything else uses Erlang's own
-%% term formatting, which is a stand-in until Stage 2/3's to_string
-%% semantics are ported here.
-to_display(Value) when is_binary(Value) ->
-    Value;
-to_display(Value) ->
-    io_lib:format("~p", [Value]).

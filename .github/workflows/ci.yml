@@ -20,4 +20,25 @@ jobs:
           otp-version: "27"
 
       - run: go build ./...
-      - run: go test ./...
+      - run: go test ./pkg/... ./cmd/...
+
+  # Stage 6: differential corpus against the pinned reference calcium-lang
+  # (see docs/DECISIONS.md D13). Deliberately a separate job: the corpus is
+  # honestly incomplete (not every example compiles/matches yet), so it
+  # shouldn't block ordinary development on an unrelated change the way a
+  # red unit-test job would.
+  differential:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+
+      - run: go test ./tests/differential/... -v

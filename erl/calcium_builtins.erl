@@ -5,7 +5,7 @@
 -module(calcium_builtins).
 -export([len/1, head/1, tail/1, to_string/1,
          map/2, filter/2, reduce/3, concat/2, push/2, range/2,
-         get/2, get/3]).
+         get/2, get/3, keys/1, values/1, index/2]).
 
 len(X) when is_list(X) -> length(X);
 len(X) when is_binary(X) -> string:length(X);
@@ -26,6 +26,24 @@ to_string(X) when is_integer(X) -> integer_to_binary(X);
 to_string(X) when is_float(X) -> float_to_binary(X, [{decimals, 6}, compact]);
 to_string(true) -> <<"true">>;
 to_string(false) -> <<"false">>;
+to_string({ok, V}) -> <<"success(", (to_string(V))/binary, ")">>;
+to_string({error, V}) -> <<"failure(", (to_string(V))/binary, ")">>;
+to_string(X) when is_list(X) ->
+    Strs = lists:map(fun to_string/1, X),
+    <<"[", (iolist_to_binary(lists:join(<<", ">>, Strs)))/binary, "]">>;
+%% NOTE: Erlang's #{} does not preserve insertion order, unlike Calcium's
+%% hash literal - a multi-key hash's rendered key order may not match the
+%% reference's. See docs/DECISIONS.md.
+to_string(X) when is_map(X) ->
+    Pairs = [<<(to_string(K))/binary, ": ", (to_string(V))/binary>> || {K, V} <- maps:to_list(X)],
+    <<"{", (iolist_to_binary(lists:join(<<", ">>, Pairs)))/binary, "}">>;
+%% An ADT value (D3's tagged-tuple convention): render as Calcium's own
+%% `Tag(v1, v2, ...)` display, matching the reference's Value.String(),
+%% not Erlang's {'Tag',v1,v2} term syntax.
+to_string(X) when is_tuple(X), is_atom(element(1, X)) ->
+    [Tag | Fields] = tuple_to_list(X),
+    Strs = lists:map(fun to_string/1, Fields),
+    <<(atom_to_binary(Tag, utf8))/binary, "(", (iolist_to_binary(lists:join(<<", ">>, Strs)))/binary, ")">>;
 to_string(X) when is_atom(X) -> atom_to_binary(X, utf8);
 to_string(X) -> unicode:characters_to_binary(io_lib:format("~p", [X])).
 
@@ -75,3 +93,15 @@ get(Arr, Key, Default) when is_list(Arr), is_integer(Key) ->
     end;
 get(Map, Key, Default) when is_map(Map) ->
     maps:get(Key, Map, Default).
+
+%% NOTE: Erlang's #{} does not preserve insertion order, unlike Calcium's
+%% hash literal - the returned order may not match the reference for a
+%% multi-key hash. See docs/DECISIONS.md.
+keys(Map) -> maps:keys(Map).
+values(Map) -> maps:values(Map).
+
+%% `arr[i]`/`hash[key]` share Calcium's `[]` syntax but are different
+%% Erlang operations - which one applies isn't known at the call site in
+%% codegen, so dispatch here instead (same reasoning as get/2,3).
+index(Arr, I) when is_list(Arr), is_integer(I) -> lists:nth(I + 1, Arr);
+index(Map, Key) when is_map(Map) -> maps:get(Key, Map).

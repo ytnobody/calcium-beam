@@ -217,3 +217,82 @@ was declared or imported, there is nothing to emit. Verified end-to-end
 compiles and its `to_bytes`/`from_bytes`/`byte_len`/`char_count`/
 `from_int`/`from_float` all run correctly on BEAM, completing the
 `core.{math,array,string,bytes}` stdlib coverage from plan item 1.
+
+## D13 — Plan item 3: differential harness, and what it immediately found (**decided**)
+
+Added `tests/differential/differential_test.go`: for each corpus file, run
+it under the pinned reference `calcium` binary (via `go run
+github.com/ytnobody/calcium-lang/cmd/calcium`, resolved through the module
+dependency - not an assumed sibling checkout) and under `calciumbeam` +
+`erlc`/`erl`, and diff stdout. Mirrors `specs/selfhost-scope.md` §5's
+methodology (behavior only, pinned reference, never copy the corpus).
+
+Running it against 8 of `calcium-lang`'s own `examples/*.ca` immediately
+found and fixed five real gaps no hand-written fixture had hit:
+
+1. **`LambdaExpression` as a bare pipe/call target** (`n |> (r => ...)`,
+   used by `factorial.ca`/`fibonacci.ca`/`strings.ca`) wasn't handled by
+   `callTarget` - fixed by rendering it as an immediately-invoked fun,
+   `(fun(...) -> ... end)(Args)` (the call-site parens are required Erlang
+   syntax, not optional).
+2. **A bare capitalized identifier in pattern/value position is a
+   zero-argument ADT tag** (`None` in `type Maybe = Some(v) | None;`), not
+   a binding - `isSimplePattern`/`pattern()`/`expr()`'s `*ast.Identifier`
+   cases all treated every identifier as a binding. Fixed by checking
+   `isUpper` first in each.
+3. **`concat` is variadic in Calcium** (`concat(a, b, c, ...)`) but
+   `calcium_builtins:concat/2` is the only arity - Erlang has no variadic
+   functions. Fixed by folding 3+ arguments into nested 2-argument calls
+   at compile time in `call()` (concatenation is associative, so fold
+   order doesn't matter).
+4. **`to_string` didn't know Calcium's own display conventions** for ADTs
+   (`Tag(v1, v2)` not `{'Tag',v1,v2}`), `success`/`failure`, arrays
+   (`[v1, v2]` not Erlang list syntax), or hashes (`{k: v, ...}`) - all
+   four now implemented in `calcium_builtins:to_string/1`, and
+   `calcium_io_native:say`/`print` now delegate to it instead of
+   duplicating a separate, far less complete `to_display/1`.
+5. **`erl -noshell`'s `standard_io` defaults to an encoding that can't
+   represent most non-ASCII code points** - confirmed directly against
+   `erl` (not assumed): `io:format("~ts", [...])` silently prints an
+   escaped `\x{2192}` instead of the actual character `→`, while Go's
+   stdout has no such restriction. Fixed by emitting
+   `io:setopts(standard_io, [{encoding, unicode}])` as `main/0`'s first
+   statement in every generated module.
+
+Also added, less dramatically: `keys`/`values` builtins (`maps:keys/values`),
+and a polymorphic `calcium_builtins:index/2` for `arr[i]`/`hash[key]` -
+Calcium's `[]` syntax covers both and which one applies isn't always known
+at the call site in codegen (`index()` previously always emitted
+`lists:nth`, breaking on any hash bracket-access), and `string.*` dispatch
+entries in `stdlibCalls` pointing straight at the already-implemented
+`calcium_str_native`/`calcium_builtins` functions, since `core.string`'s
+public functions are 1:1 primitive passthroughs (unlike `core.array`'s,
+mostly compiled logic - see D8).
+
+### Two known gaps the harness surfaces and does not yet close
+
+- **Erlang's `#{}` does not preserve insertion order**, unlike Calcium's
+  hash literal. `hash.ca` matches except for `keys`/`values`/`to_string`'s
+  rendered key order on a multi-key hash. A real fix means revisiting D3's
+  hash representation (e.g. an order-preserving association list), which
+  has its own tension with arrays also being Erlang lists (a hash-as-
+  proplist could structurally collide with an array of 2-tuples) -
+  deliberately not rushed; tracked here rather than hacked around.
+- **`core.array`'s non-primitive functions aren't reachable via
+  `array.foo(...)`** the way `core.string`'s are: `array.ca`'s functions
+  are compiled Calcium logic (D8), not primitive passthroughs, so there's
+  no native implementation to alias `array.reverse` to the way
+  `string.trim` aliases to `calcium_str_native:trim`. Closing this needs
+  `calciumbeam` (or at least the differential harness) to auto-compile and
+  link `array.ca` as its own module whenever a source file has
+  `use core.array;` - a real feature, not a one-line fix, left for a later
+  pass rather than hand-porting `array.ca`'s ~20 non-primitive functions
+  into `erl/` and abandoning D8 for this one module.
+
+Result: 6/8 of the current corpus matches end-to-end
+(`hello.ca`/`factorial.ca`/`fibonacci.ca`/`strings.ca`/`adt_simple.ca`/
+`adt.ca`); `hash.ca` and `pipeline.ca` fail for the two reasons above, not
+silently - the harness reports per-file pass/fail, not just an aggregate.
+Wired into CI as its own job (`.github/workflows/ci.yml`), separate from
+the unit-test job, so this honestly-incomplete corpus doesn't block
+ordinary development on an unrelated change.
