@@ -204,8 +204,10 @@ c = {name: "calcium"};`)
 	}
 	// The reference parser rewrites a bare-identifier hash key into a
 	// string literal (parseHashPair), so the key renders as a binary too.
-	if !strings.Contains(out, `V_c = #{<<"name"/utf8>> => <<"calcium"/utf8>>}`) {
-		t.Errorf("expected hash/map literal:\n%s", out)
+	// Hashes render as {hash, [...]} (an ordered pair list), not a bare
+	// Erlang map, to preserve insertion order - see hashLiteral.
+	if !strings.Contains(out, `V_c = {hash, [{<<"name"/utf8>>, <<"calcium"/utf8>>}]}`) {
+		t.Errorf("expected hash literal:\n%s", out)
 	}
 }
 
@@ -528,7 +530,7 @@ r = Secret.map(s, leaky);`)
 
 func TestSecretCapability(t *testing.T) {
 	out := compile(t, `cap = Secret.capability(test.secret_sink, {scope: "x"});`)
-	if !strings.Contains(out, `V_cap = calcium_secret:capability(<<"test.secret_sink"/utf8>>, #{<<"scope"/utf8>> => <<"x"/utf8>>})`) {
+	if !strings.Contains(out, `V_cap = calcium_secret:capability(<<"test.secret_sink"/utf8>>, {hash, [{<<"scope"/utf8>>, <<"x"/utf8>>}]})`) {
 		t.Errorf("expected Secret.capability dispatch with the derived sink name:\n%s", out)
 	}
 }

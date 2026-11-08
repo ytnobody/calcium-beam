@@ -70,13 +70,13 @@ prop({task, Ref}, <<"status">>) ->
     atom_to_binary(Status, utf8);
 prop({task, Ref}, <<"result">>) ->
     [{Ref, _, Result}] = ets:lookup(calcium_tasks, Ref),
-    Result;
+    Result.
 %% task.done (an EventSource for use with async.expects/stay) is not
 %% implemented - no current example needs it, and getting its message
 %% shape right (task_result vs the source_fired shape stay_loop expects)
 %% needs its own verification rather than a guess. See docs/DECISIONS.md D15.
-prop(Map, Name) when is_map(Map) ->
-    maps:get(Name, Map).
+%% (A hash field never reaches here - calcium_builtins:prop/2 handles
+%% {hash, Pairs} itself before falling back to this module.)
 
 %% invoke/3 is prop/2's counterpart for a method *call*
 %% (`handler.ready()`), dispatched the same way.

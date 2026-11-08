@@ -7,9 +7,9 @@
          map/2, filter/2, reduce/3, concat/2, push/2, range/2,
          get/2, get/3, keys/1, values/1, index/2, add/2, prop/2, invoke/3]).
 
+len({hash, Pairs}) -> length(Pairs);
 len(X) when is_list(X) -> length(X);
 len(X) when is_binary(X) -> string:length(X);
-len(X) when is_map(X) -> maps:size(X);
 len(X) when is_tuple(X) -> tuple_size(X).
 
 %% head returns Maybe.Some(H)/Maybe.None (pkg/vm/vm.go's builtinHead);
@@ -37,12 +37,13 @@ to_string({secret_capability, _, _}) -> <<"<secret capability>">>;
 to_string(X) when is_list(X) ->
     Strs = lists:map(fun to_string/1, X),
     <<"[", (iolist_to_binary(lists:join(<<", ">>, Strs)))/binary, "]">>;
-%% NOTE: Erlang's #{} does not preserve insertion order, unlike Calcium's
-%% hash literal - a multi-key hash's rendered key order may not match the
-%% reference's. See docs/DECISIONS.md.
-to_string(X) when is_map(X) ->
-    Pairs = [<<(to_string(K))/binary, ": ", (to_string(V))/binary>> || {K, V} <- maps:to_list(X)],
-    <<"{", (iolist_to_binary(lists:join(<<", ">>, Pairs)))/binary, "}">>;
+%% {hash, Pairs} is an ordered pair list (see hashLiteral in pkg/codegen),
+%% not an Erlang map - #{} does not preserve insertion order, unlike the
+%% reference's Go-map-based Hash. Must come before the generic ADT-tuple
+%% clause below, since {hash, [...]} would otherwise match it.
+to_string({hash, Pairs}) ->
+    Strs = [<<(to_string(K))/binary, ": ", (to_string(V))/binary>> || {K, V} <- Pairs],
+    <<"{", (iolist_to_binary(lists:join(<<", ">>, Strs)))/binary, "}">>;
 %% An ADT value (D3's tagged-tuple convention): render as Calcium's own
 %% `Tag(v1, v2, ...)` display, matching the reference's Value.String(),
 %% not Erlang's {'Tag',v1,v2} term syntax.
@@ -86,10 +87,10 @@ get(Arr, Key) when is_list(Arr), is_integer(Key) ->
         Key >= 0 andalso Key < length(Arr) -> {'Some', lists:nth(Key + 1, Arr)};
         true -> 'None'
     end;
-get(Map, Key) when is_map(Map) ->
-    case maps:find(Key, Map) of
-        {ok, V} -> {'Some', V};
-        error -> 'None'
+get({hash, Pairs}, Key) ->
+    case lists:keyfind(Key, 1, Pairs) of
+        {_, V} -> {'Some', V};
+        false -> 'None'
     end.
 
 get(Arr, Key, Default) when is_list(Arr), is_integer(Key) ->
@@ -97,20 +98,22 @@ get(Arr, Key, Default) when is_list(Arr), is_integer(Key) ->
         Key >= 0 andalso Key < length(Arr) -> lists:nth(Key + 1, Arr);
         true -> Default
     end;
-get(Map, Key, Default) when is_map(Map) ->
-    maps:get(Key, Map, Default).
+get({hash, Pairs}, Key, Default) ->
+    case lists:keyfind(Key, 1, Pairs) of
+        {_, V} -> V;
+        false -> Default
+    end.
 
-%% NOTE: Erlang's #{} does not preserve insertion order, unlike Calcium's
-%% hash literal - the returned order may not match the reference for a
-%% multi-key hash. See docs/DECISIONS.md.
-keys(Map) -> maps:keys(Map).
-values(Map) -> maps:values(Map).
+%% {hash, Pairs} preserves insertion order, matching the reference's
+%% Go-map-based Hash exactly - see hashLiteral in pkg/codegen.
+keys({hash, Pairs}) -> [K || {K, _} <- Pairs].
+values({hash, Pairs}) -> [V || {_, V} <- Pairs].
 
 %% `arr[i]`/`hash[key]` share Calcium's `[]` syntax but are different
 %% Erlang operations - which one applies isn't known at the call site in
 %% codegen, so dispatch here instead (same reasoning as get/2,3).
 index(Arr, I) when is_list(Arr), is_integer(I) -> lists:nth(I + 1, Arr);
-index(Map, Key) when is_map(Map) -> maps:get(Key, Map).
+index({hash, Pairs}, Key) -> {_, V} = lists:keyfind(Key, 1, Pairs), V.
 
 %% `+` is polymorphic in Calcium: if either operand is a string, it's
 %% concatenation with the other side auto-stringified, not just numeric
@@ -123,9 +126,10 @@ add(A, B) -> A + B.
 %% `.` access (`person.name`, `handler.status`, `task.result`) shares
 %% one syntax in Calcium for several different runtime operations; which
 %% one applies isn't known at the call site in pkg/codegen, so dispatch
-%% here on the object's actual shape - a hash falls through to maps:get,
-%% anything else (a Handler/Task tuple so far) delegates to calcium_async.
-prop(Map, Name) when is_map(Map) -> maps:get(Name, Map);
+%% here on the object's actual shape - a hash falls through to its pair
+%% list, anything else (a Handler/Task tuple so far) delegates to
+%% calcium_async.
+prop({hash, Pairs}, Name) -> {_, V} = lists:keyfind(Name, 1, Pairs), V;
 prop(Obj, Name) -> calcium_async:prop(Obj, Name).
 
 %% Method-call counterpart (`handler.ready()`) - same dispatch idea, for

@@ -271,13 +271,8 @@ mostly compiled logic - see D8).
 
 ### Two known gaps the harness surfaces and does not yet close
 
-- **Erlang's `#{}` does not preserve insertion order**, unlike Calcium's
-  hash literal. `hash.ca` matches except for `keys`/`values`/`to_string`'s
-  rendered key order on a multi-key hash. A real fix means revisiting D3's
-  hash representation (e.g. an order-preserving association list), which
-  has its own tension with arrays also being Erlang lists (a hash-as-
-  proplist could structurally collide with an array of 2-tuples) -
-  deliberately not rushed; tracked here rather than hacked around.
+- ~~Erlang's `#{}` does not preserve insertion order, unlike Calcium's hash
+  literal~~ - **fixed, see D17.**
 - **`core.array`'s non-primitive functions aren't reachable via
   `array.foo(...)`** the way `core.string`'s are: `array.ca`'s functions
   are compiled Calcium logic (D8), not primitive passthroughs, so there's
@@ -500,3 +495,23 @@ than the reference for that one shape, not a parity claim.
   gaps the reference's own version has - not full taint tracking,
   defeated by passing a Secret through an untracked intermediate call in
   both implementations equally.
+
+## D17 — Hash insertion order: `{hash, Pairs}`, not a bare Erlang map (**decided**)
+
+D13 flagged Erlang's `#{}` not preserving insertion order as a known gap
+against the reference's Go-map-based Hash. Not a security concern — this is
+display/iteration order, unrelated to hash-flood-DoS seed randomization,
+which is about the hash *function*, not insertion order.
+
+Fixed by changing the Hash representation from a bare `#{...}` to
+`{hash, [{K1, V1}, {K2, V2}, ...]}` — an ordered pair list wrapped in a tag,
+so it can't be confused with a tuple-ADT value or a plain array. `hashLiteral`
+emits it directly in source order; `calcium_builtins`'s `len`/`to_string`/
+`get/2,3`/`keys`/`values`/`index`/`prop` all match on `{hash, Pairs}` and use
+`lists:keyfind/3` instead of `maps:find`/`maps:get`. O(n) lookup instead of
+Erlang maps' near-O(1) — not a concern at the sizes `calciumbeam`'s current
+corpus and stdlib reuse (D8) exercise; revisit if a hash-heavy workload ever
+shows up.
+
+Differential corpus: 12/13 (`hash.ca` now matches exactly). Only
+`pipeline.ca`'s `core.array` auto-linking gap remains (see D13).

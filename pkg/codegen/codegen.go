@@ -309,9 +309,12 @@ func (g *generator) tupleLiteral(n *ast.TupleLiteral) (string, error) {
 	return fmt.Sprintf("{%s}", strings.Join(elems, ", ")), nil
 }
 
-// hashLiteral renders a Calcium hash as an Erlang map. The reference parser
-// (parseHashPair) already rewrites a bare-identifier key (`{name: ...}`)
-// into a *ast.StringLiteral, so every key here is an ordinary expression.
+// hashLiteral renders a Calcium hash as {hash, [{K, V}, ...]} - an ordered
+// pair list, not a bare Erlang map, because #{} does not preserve insertion
+// order the way the reference's Go-map-based Hash does (see
+// docs/DECISIONS.md). The reference parser (parseHashPair) already rewrites
+// a bare-identifier key (`{name: ...}`) into a *ast.StringLiteral, so every
+// key here is an ordinary expression.
 func (g *generator) hashLiteral(n *ast.HashLiteral) (string, error) {
 	pairs := make([]string, len(n.Pairs))
 	for i, p := range n.Pairs {
@@ -323,9 +326,9 @@ func (g *generator) hashLiteral(n *ast.HashLiteral) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		pairs[i] = fmt.Sprintf("%s => %s", key, val)
+		pairs[i] = fmt.Sprintf("{%s, %s}", key, val)
 	}
-	return fmt.Sprintf("#{%s}", strings.Join(pairs, ", ")), nil
+	return fmt.Sprintf("{hash, [%s]}", strings.Join(pairs, ", ")), nil
 }
 
 func (g *generator) index(n *ast.IndexExpression) (string, error) {
