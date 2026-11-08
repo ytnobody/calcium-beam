@@ -89,12 +89,18 @@ func TestCorpus(t *testing.T) {
 
 // runReference runs a .ca file under the pinned reference calcium binary
 // (resolved via the module dependency in go.mod/go.sum, not an assumed
-// sibling checkout) and returns its stdout.
+// sibling checkout) and returns its stdout. Only stdout is compared: on a
+// cold module cache (e.g. a fresh CI runner), `go run` prints "go:
+// downloading ..." to stderr, which CombinedOutput would otherwise mix into
+// the compared text.
 func runReference(t *testing.T, caFile string) (string, error) {
 	t.Helper()
-	out, err := exec.Command("go", "run", "github.com/ytnobody/calcium-lang/cmd/calcium", caFile).CombinedOutput()
+	cmd := exec.Command("go", "run", "github.com/ytnobody/calcium-lang/cmd/calcium", caFile)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return string(out), err
+		return stderr.String(), err
 	}
 	return string(out), nil
 }
