@@ -4,3 +4,4 @@
 /tests/**/*.erl
 *.beam
 /calciumbeam
+erl_crash.dump
