@@ -3,10 +3,9 @@
 Compiles [Calcium](https://github.com/ytnobody/calcium-lang) source to
 Erlang, built for the BEAM virtual machine.
 
-Status: early scaffolding. See `docs/DECISIONS.md` for scope and design
-decisions, and `specs/selfhost-scope.md` / `specs/bone-format.md` /
-`specs/ffi-primitives.md` in `calcium-lang` for the contracts this project
-works against.
+See `docs/DECISIONS.md` for scope and design decisions, and
+`specs/selfhost-scope.md` / `specs/bone-format.md` / `specs/ffi-primitives.md`
+in `calcium-lang` for the contracts this project works against.
 
 ## Why BEAM
 
@@ -36,8 +35,36 @@ tests/             differential corpus runner against the pinned calcium-lang
 docs/DECISIONS.md  scope and design decisions
 ```
 
+## Usage
+
+```sh
+go build -o calciumbeam ./cmd/calciumbeam
+./calciumbeam path/to/program.ca          # writes calcium_program.erl
+
+erlc -o <outdir> erl/*.erl calcium_program.erl
+erl -noshell -pa <outdir> -eval "calcium_program:main(), halt()."
+```
+
 ## Status
 
-Stage 1 (core language: literals, arithmetic, functions, match, tail calls)
-is in progress. See `docs/DECISIONS.md` and the plan this project started
-from for the full staged scope.
+All five planned stages are implemented:
+
+1. `core.{math,array,string,bytes}` — compiled from `calcium-lang`'s own
+   stdlib `.ca` sources unmodified, backed by native Erlang primitives.
+2. Core language semantics — `func!` success-wrapping, ADTs, pattern match,
+   `head`/`tail` Maybe semantics, pipes.
+3. A differential test harness (`tests/differential`) that runs the same
+   `.ca` program under the pinned reference `calcium` binary and under
+   `calciumbeam` + `erlc`/`erl`, and diffs the output. Currently 11/13 of
+   the corpus matches exactly; the two known gaps (hash key ordering,
+   `core.array` auto-linking) are documented in `docs/DECISIONS.md`.
+4. `async.spawn`/`all`/`expects`/`stay`/`continue`/`leave`/`cancel` —
+   compiled to native BEAM processes and messages, not a reimplemented
+   scheduler.
+5. `Secret`/`SecretCapability` — capability-gated effects (`!!!>`,
+   `Secret.with`), with its own design note and known limitations in
+   `docs/DECISIONS.md` (D16).
+
+Each stage's known limitations are stated explicitly in `docs/DECISIONS.md`
+rather than left implicit — read it before relying on this for anything
+beyond the documented scope.
