@@ -31,6 +31,7 @@ var corpus = []string{
 	"adt_simple.ca",
 	"adt.ca",
 	"pipeline.ca",
+	"async_all.ca",
 }
 
 func TestCorpus(t *testing.T) {

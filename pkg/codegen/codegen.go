@@ -411,6 +411,15 @@ func (g *generator) infix(n *ast.InfixExpression) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// `+` is polymorphic in Calcium: if either operand is a string, it's
+	// concatenation with the other side auto-stringified (confirmed in
+	// pkg/vm/vm.go's executeBinaryOp - checked before the numeric branch,
+	// not just when both sides are strings), not just numeric addition.
+	// Which case applies isn't always known at compile time, so dispatch
+	// at runtime rather than always emitting Erlang's numeric `+`.
+	if n.Operator == "+" {
+		return fmt.Sprintf("calcium_builtins:add(%s, %s)", left, right), nil
+	}
 	op, ok := infixOps[n.Operator]
 	if !ok {
 		return "", fmt.Errorf("codegen: unsupported operator %q", n.Operator)
@@ -422,7 +431,7 @@ func (g *generator) infix(n *ast.InfixExpression) (string, error) {
 // `==`/`!=` map to Erlang's exact-match operators (`=:=`/`=/=`), matching
 // Calcium's value equality rather than Erlang's type-coercing `==`/`/=`.
 var infixOps = map[string]string{
-	"+": "+", "-": "-", "*": "*", "/": "/", "%": "rem",
+	"-": "-", "*": "*", "/": "/", "%": "rem",
 	"==": "=:=", "!=": "=/=",
 	"<": "<", ">": ">", "<=": "=<", ">=": ">=",
 	"&&": "andalso", "||": "orelse",
@@ -602,6 +611,10 @@ var stdlibCalls = map[string]string{
 	"string.char_at":     "calcium_str_native:char_at",
 	"string.length":      "calcium_str_native:len",
 	"string.substring":   "calcium_str_native:substring",
+	// core.async's standalone-usable functions (D14) - async.stay/expects
+	// are a separate, larger effort.
+	"async.spawn": "calcium_async:spawn_",
+	"async.all":   "calcium_async:all_",
 }
 
 // builtinCalls maps a global built-in function name (no module qualifier) to

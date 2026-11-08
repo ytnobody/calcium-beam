@@ -28,7 +28,7 @@ func compile(t *testing.T, src string) string {
 
 func TestArithmetic(t *testing.T) {
 	out := compile(t, "x = 1 + 2 * 3;")
-	if !strings.Contains(out, "V_x = (1 + (2 * 3))") {
+	if !strings.Contains(out, "V_x = calcium_builtins:add(1, (2 * 3))") {
 		t.Errorf("unexpected output:\n%s", out)
 	}
 }
@@ -226,7 +226,7 @@ func TestDoExpression(t *testing.T) {
     a = 1;
     a + 1
 end;`)
-	if !strings.Contains(out, "V_x = (V_a = 1, (V_a + 1))") {
+	if !strings.Contains(out, "V_x = (V_a = 1, calcium_builtins:add(V_a, 1))") {
 		t.Errorf("unexpected do-expression output:\n%s", out)
 	}
 }

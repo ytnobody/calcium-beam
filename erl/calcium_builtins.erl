@@ -5,7 +5,7 @@
 -module(calcium_builtins).
 -export([len/1, head/1, tail/1, to_string/1,
          map/2, filter/2, reduce/3, concat/2, push/2, range/2,
-         get/2, get/3, keys/1, values/1, index/2]).
+         get/2, get/3, keys/1, values/1, index/2, add/2]).
 
 len(X) when is_list(X) -> length(X);
 len(X) when is_binary(X) -> string:length(X);
@@ -105,3 +105,11 @@ values(Map) -> maps:values(Map).
 %% codegen, so dispatch here instead (same reasoning as get/2,3).
 index(Arr, I) when is_list(Arr), is_integer(I) -> lists:nth(I + 1, Arr);
 index(Map, Key) when is_map(Map) -> maps:get(Key, Map).
+
+%% `+` is polymorphic in Calcium: if either operand is a string, it's
+%% concatenation with the other side auto-stringified, not just numeric
+%% addition (pkg/vm/vm.go's executeBinaryOp checks this before the
+%% numeric branch).
+add(A, B) when is_binary(A); is_binary(B) ->
+    <<(to_string(A))/binary, (to_string(B))/binary>>;
+add(A, B) -> A + B.

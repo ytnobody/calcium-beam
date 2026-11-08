@@ -296,3 +296,45 @@ silently - the harness reports per-file pass/fail, not just an aggregate.
 Wired into CI as its own job (`.github/workflows/ci.yml`), separate from
 the unit-test job, so this honestly-incomplete corpus doesn't block
 ordinary development on an unrelated change.
+
+## D14 — Plan item 4, phase 1: `async.spawn`/`async.all` (**decided**)
+
+Checked how async actually compiles before assuming the `OpSpawn`/
+`OpTimeout`/`OpInterval`/etc. opcodes in `specs/bone-format.md` applied:
+they don't, for most of `core.async`. `grep`-ing `pkg/compiler/compiler.go`
+for `OpSpawn` turns up nothing - `async.spawn`, `async.expects`,
+`async.cancel`, `async.all`, and `async.channel` are all plain functions
+registered on the `core.async` module (`pkg/vm/vm.go:445-456`), reached
+through ordinary `OpCall`, not dedicated bytecode. Only `async.stay(state)
+{ ... }` is special syntax compiled via `OpStayBegin`/`OpStayEnd`/
+`OpStayGetState`/`OpContinue`/`OpLeave` (confirmed via
+`compileStayExpression`) - the opcode table's other async entries are
+vestigial as far as the current compiler is concerned.
+
+This splits Stage 4's work more unevenly than the plan assumed:
+`spawn`/`all` (and, not yet done, `channel`/`cancel`/`timeout`/`interval`)
+are ordinary `stdlibCalls` dispatches needing no codegen changes - added
+`erl/calcium_async.erl`'s `spawn_/1` (spawns a process, result delivered
+as `{task_result, Pid, Result}`, `TYPE_TASK`'s opaque handle is just the
+`pid()` per D3) and `all_/1` (waits per-task in input order, matching
+`pkg/vm/vm.go`'s `builtinAsyncAll`). `async.stay`/`expects` is the real
+remaining work (a stateful event-loop DSL - `executeStayBegin`/
+`runStayLoop`/`executeContinue`/`executeLeave` in `pkg/vm/vm.go`), and
+every corpus example beyond the simplest (`async_all.ca`) needs it -
+`async_spawn.ca` itself uses `async.stay`+`expects` to wait on a spawned
+task's result, confirming it's not an optional nicety, just something
+`async.all` alone can route around. Tracked as its own follow-up, not
+assumed to be a smaller or separable piece than it is.
+
+Also fixed, found while verifying `async_all.ca` end-to-end rather than a
+feature of async itself: **`+` is polymorphic in Calcium** - if either
+operand is a string, it concatenates with the other side auto-stringified
+(`pkg/vm/vm.go`'s `executeBinaryOp` checks this before the numeric
+branch), not just numeric addition. `"Results: " + to_string(results)`
+crashed with `badarith` until `infix()` routed `+` through a new
+`calcium_builtins:add/2` runtime dispatch instead of always emitting
+Erlang's numeric `+` - which value's operand type isn't always knowable
+at compile time, same reasoning as `get`/`index`'s runtime dispatch.
+
+`async_all.ca` now matches end-to-end, added to the differential corpus
+(7/9 now).
