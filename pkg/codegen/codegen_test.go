@@ -35,10 +35,10 @@ func TestArithmetic(t *testing.T) {
 
 func TestFunctionDeclaration(t *testing.T) {
 	out := compile(t, "func double(n) = n * 2;")
-	if !strings.Contains(out, "double(V_n) ->") || !strings.Contains(out, "(V_n * 2)") {
+	if !strings.Contains(out, "'double'(V_n) ->") || !strings.Contains(out, "(V_n * 2)") {
 		t.Errorf("unexpected output:\n%s", out)
 	}
-	if !strings.Contains(out, "double/1") {
+	if !strings.Contains(out, "'double'/1") {
 		t.Errorf("expected double/1 in exports:\n%s", out)
 	}
 }
@@ -47,8 +47,8 @@ func TestMatchWithGuardAndWildcard(t *testing.T) {
 	out := compile(t, `func abs(n) = match n < 0
     true => -n
     _ => n;`)
-	if !strings.Contains(out, "case (V_n < 0) of") {
-		t.Errorf("expected case expression:\n%s", out)
+	if !strings.Contains(out, "case V__subject of") || !strings.Contains(out, "(V_n < 0))") {
+		t.Errorf("expected case expression over the bound subject:\n%s", out)
 	}
 	if !strings.Contains(out, "true -> (-V_n)") {
 		t.Errorf("expected true arm:\n%s", out)
@@ -64,6 +64,27 @@ func TestMatchWithExplicitGuard(t *testing.T) {
     _ => 0;`)
 	if !strings.Contains(out, "when (V_x > 0) -> 1") {
 		t.Errorf("expected guarded arm:\n%s", out)
+	}
+}
+
+// TestMatchWithComputedPattern covers the reference compiler's "standard
+// case" semantics (pkg/compiler/compiler.go's compileMatch): a pattern that
+// isn't a literal/wildcard/constructor is compiled as an expression and
+// compared for equality against the subject, so `match true / n < 0 => ...`
+// is valid - the `sign` idiom in calcium-lang's core/math.ca.
+func TestMatchWithComputedPattern(t *testing.T) {
+	out := compile(t, `func sign(n) = match true
+    n < 0 => -1
+    n > 0 => 1
+    true => 0;`)
+	if !strings.Contains(out, "_ when ((V_n < 0)) =:= V__subject -> (-1)") {
+		t.Errorf("expected equality-guard fallback for the first arm:\n%s", out)
+	}
+	if !strings.Contains(out, "_ when ((V_n > 0)) =:= V__subject -> 1") {
+		t.Errorf("expected equality-guard fallback for the second arm:\n%s", out)
+	}
+	if !strings.Contains(out, "true -> 0") {
+		t.Errorf("expected the literal true arm to still use a direct pattern:\n%s", out)
 	}
 }
 
@@ -109,7 +130,7 @@ func TestBifNameCollisionCompiles(t *testing.T) {
 // success(...) wrapping.
 func TestEffectFunctionCompilesWithoutWrapping(t *testing.T) {
 	out := compile(t, "func! identity(x) = x;")
-	if !strings.Contains(out, "identity(V_x) ->\n    V_x.") {
+	if !strings.Contains(out, "'identity'(V_x) ->\n    V_x.") {
 		t.Errorf("expected unwrapped body:\n%s", out)
 	}
 }
@@ -175,7 +196,7 @@ func TestPipeAndEffectPipe(t *testing.T) {
 	out := compile(t, `func double(n) = n * 2;
 x = 5 |> double;
 "hi" !> io.say;`)
-	if !strings.Contains(out, "double(5)") {
+	if !strings.Contains(out, "'double'(5)") {
 		t.Errorf("expected pipe desugared to a call:\n%s", out)
 	}
 	if !strings.Contains(out, `calcium_io:say(<<"hi"/utf8>>)`) {
@@ -201,10 +222,10 @@ y = result !? {
     success(v) => use_value(v)
     failure(e) => handle_error(e)
 };`)
-	if !strings.Contains(out, "{ok, V_v} -> use_value(V_v)") {
+	if !strings.Contains(out, "{ok, V_v} -> 'use_value'(V_v)") {
 		t.Errorf("expected success arm:\n%s", out)
 	}
-	if !strings.Contains(out, "{error, V_e} -> handle_error(V_e)") {
+	if !strings.Contains(out, "{error, V_e} -> 'handle_error'(V_e)") {
 		t.Errorf("expected failure arm:\n%s", out)
 	}
 }
@@ -271,5 +292,121 @@ to_string(sum([1, 2, 3, 4])) !> io.say;`)
 	}
 	if !strings.Contains(string(runOut), "10") {
 		t.Errorf("expected output to contain the sum 10, got:\n%s", runOut)
+	}
+}
+
+// TestLeadingUnderscoreGlobalIsQuoted is a regression test for D10 #1: an
+// unquoted Erlang atom starting with `_` lexes as a variable, not a
+// function name - exactly what calcium-lang's array.ca's private helpers
+// (_min, _reverse_fn, ...) are named.
+func TestLeadingUnderscoreGlobalIsQuoted(t *testing.T) {
+	out := compile(t, "func _helper(x) = x + 1;")
+	if !strings.Contains(out, "'_helper'(V_x) ->") {
+		t.Errorf("expected a quoted atom for the leading-underscore function name:\n%s", out)
+	}
+}
+
+// TestGlobalFunctionPassedAsValue is a regression test for D10 #2: a
+// top-level function referenced as a value (not called directly) needs an
+// explicit `fun 'name'/Arity` reference in Erlang.
+func TestGlobalFunctionPassedAsValue(t *testing.T) {
+	out := compile(t, `func inc(x) = x + 1;
+func apply_twice(fn, x) = fn(fn(x));
+y = apply_twice(inc, 1);`)
+	if !strings.Contains(out, "V_y = 'apply_twice'(fun 'inc'/1, 1)") {
+		t.Errorf("expected a fun/arity reference for the global passed as a value:\n%s", out)
+	}
+	// Inside apply_twice's own body, `fn` is a parameter (a local variable
+	// holding a fun), so it must be called as a variable, not an atom.
+	if !strings.Contains(out, "V_fn(V_fn(V_x))") {
+		t.Errorf("expected calls through the local fun-valued parameter:\n%s", out)
+	}
+}
+
+// TestCalciumLangArrayCaEndToEnd compiles calcium-lang's actual array.ca
+// stdlib source (unmodified) and runs several of its ~25 functions on real
+// BEAM - see docs/DECISIONS.md D8 (reuse calcium-lang's own stdlib .ca
+// source) and D10 (the two bugs this specifically surfaced). Skips if
+// erlc/erl aren't on PATH, or if the calcium-lang module isn't resolvable
+// (e.g. no network access for `go list` to fetch it).
+// compileStdlibFile locates and compiles one of calcium-lang's own stdlib
+// .ca files via the imported Go module (not an assumed sibling checkout),
+// skipping the test if erlc/erl aren't available or the module can't be
+// resolved (e.g. no network access for `go list` to fetch it).
+func compileStdlibFile(t *testing.T, relPath, moduleName string, supportFiles ...string) (dir string, erlc, erl string) {
+	t.Helper()
+	erlcPath, err := exec.LookPath("erlc")
+	if err != nil {
+		t.Skip("erlc not found, skipping end-to-end BEAM compile check")
+	}
+	erlPath, err := exec.LookPath("erl")
+	if err != nil {
+		t.Skip("erl not found, skipping end-to-end BEAM compile check")
+	}
+
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/ytnobody/calcium-lang").Output()
+	if err != nil {
+		t.Skipf("could not resolve the calcium-lang module: %v", err)
+	}
+	src, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(out)), relPath))
+	if err != nil {
+		t.Skipf("could not read %s: %v", relPath, err)
+	}
+
+	l := lexer.New(string(src))
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if errs := p.Errors(); len(errs) > 0 {
+		t.Fatalf("parse errors in %s: %v", relPath, errs)
+	}
+	erlSrc, err := Module(moduleName, program)
+	if err != nil {
+		t.Fatalf("codegen: %v", err)
+	}
+
+	dir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, moduleName+".erl"), []byte(erlSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", "erl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-o", dir}
+	for _, f := range supportFiles {
+		args = append(args, filepath.Join(repoRoot, f))
+	}
+	args = append(args, filepath.Join(dir, moduleName+".erl"))
+	if out, err := exec.Command(erlcPath, args...).CombinedOutput(); err != nil {
+		t.Fatalf("erlc failed: %v\n%s", err, out)
+	}
+
+	return dir, erlcPath, erlPath
+}
+
+func TestCalciumLangArrayCaEndToEnd(t *testing.T) {
+	dir, _, erl := compileStdlibFile(t, "pkg/vm/stdlib/core/array.ca", "calcium_array", "calcium_builtins.erl")
+
+	runOut, err := exec.Command(erl, "-noshell", "-pa", dir, "-eval",
+		`io:format("~p ~p ~p~n", [calcium_array:reverse([1,2,3]), calcium_array:sum([1,2,3,4]), calcium_array:sort([3,1,2])]), halt().`).CombinedOutput()
+	if err != nil {
+		t.Fatalf("erl run failed: %v\n%s", err, runOut)
+	}
+	if !strings.Contains(string(runOut), "[3,2,1] 10 [1,2,3]") {
+		t.Errorf("unexpected output:\n%s", runOut)
+	}
+}
+
+func TestCalciumLangMathCaEndToEnd(t *testing.T) {
+	dir, _, erl := compileStdlibFile(t, "pkg/vm/stdlib/core/math.ca", "calcium_math", "calcium_primitives.erl")
+
+	runOut, err := exec.Command(erl, "-noshell", "-pa", dir, "-eval",
+		`io:format("~p ~p ~p~n", [calcium_math:abs(-5), calcium_math:sign(-3), calcium_math:clamp(15,0,10)]), halt().`).CombinedOutput()
+	if err != nil {
+		t.Fatalf("erl run failed: %v\n%s", err, runOut)
+	}
+	if !strings.Contains(string(runOut), "5 -1 10") {
+		t.Errorf("unexpected output:\n%s", runOut)
 	}
 }

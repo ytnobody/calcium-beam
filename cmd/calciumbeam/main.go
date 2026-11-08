@@ -47,7 +47,10 @@ func run(path string) error {
 		return fmt.Errorf("type errors:\n%s", strings.Join(lines, "\n"))
 	}
 
-	moduleName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	// Prefixed so a source file named e.g. math.ca or string.ca doesn't
+	// generate a module that shadows Erlang/OTP's own math/string/... when
+	// both end up on the same code path - see docs/DECISIONS.md D9.
+	moduleName := "calcium_" + strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	erl, err := codegen.Module(moduleName, program)
 	if err != nil {
 		return err

@@ -89,3 +89,63 @@ The reference implementation's `head(array)` returns `Maybe.Some(value)` /
 on an empty list instead. Acceptable for Stage 2 fixtures (none call `head`/`tail`
 on an empty array), but must be fixed - wrapping in `{ok, 'Some', V}`/`'None'`
 per D3's tagged-tuple convention - before claiming general array stdlib support.
+
+## D8 — Reuse `calcium-lang`'s own stdlib `.ca` source instead of hand-porting (**decided**)
+
+`core.array`'s and `core.math`'s public functions are, with a handful of
+exceptions (the ~10 native math primitives, `__floor`/`__sqrt`/...), pure
+Calcium source calling only already-implemented built-ins (`map`, `filter`,
+`reduce`, `concat`, `range`, `head`, `tail`, `len`). Compiling
+`calcium-lang/pkg/vm/stdlib/core/{array,math}.ca` directly through
+`calciumbeam` - exactly like user source - gives the full function set for
+the cost of the few native primitives, instead of hand-reimplementing ~25
+array functions and ~15 math functions one at a time. Verified end-to-end:
+`calcium-lang`'s actual `math.ca`, compiled unmodified, runs `abs`/`sign`/
+`clamp`/`pow` correctly on BEAM.
+
+`core.string` is expected to work the same way once its ~13 native
+`__str_*` primitives exist in `erl/`, since its own public functions are
+likewise pure Calcium wrapping those primitives.
+
+## D9 — Generated module names are prefixed to avoid shadowing OTP modules (**decided**)
+
+Compiling `calcium-lang`'s `math.ca` verbatim produces a module literally
+named `math`, which shadows Erlang/OTP's own `math` module if both end up
+on the same code path (confirmed: loading it made `math:abs/1` resolve to
+the generated module instead of the BIF, and `math:sqrt_/1` fail with
+`undef` since that function lives in `erl/calcium_primitives.erl`, not the
+generated module). The same risk applies to `string`, `lists`, `os`, `io`,
+and other common OTP module names a Calcium source file could be named
+after. `cmd/calciumbeam/main.go` now derives the Erlang module name as
+`calcium_<basename>`, not `<basename>`, closing this for every generated
+module - `pkg/codegen.Module` itself still takes an arbitrary name (used
+directly by its unit tests) since the hazard is specifically about
+file-name-derived module names colliding with real OTP modules.
+
+## D10 — Two correctness bugs found by compiling `array.ca` for real (**fixed**)
+
+Compiling `calcium-lang`'s actual `array.ca` (D8) surfaced two bugs no
+hand-written fixture had exercised:
+
+1. **Leading-underscore identifiers aren't valid unquoted Erlang atoms.**
+   `array.ca`'s private helpers (`_min`, `_reverse_fn`, `_first_or_neg1`, ...)
+   produced `erlc` syntax errors, because an unquoted atom starting with `_`
+   lexes as an Erlang *variable*, not a function name. Fixed by having
+   `erlAtom` always single-quote its output (`'_min'`), which sidesteps
+   every such restriction rather than special-casing leading underscores.
+2. **A global function passed as a first-class value needs an explicit fun
+   reference.** `reduce(arr, _reverse_fn, [])` passes `_reverse_fn` as a
+   value, not a call; `expr()`'s `*ast.Identifier` case previously rendered
+   every identifier as a local-variable reference (`V_name`), which is
+   wrong for a reference to a top-level function - Erlang needs
+   `fun 'name'/Arity` to use a named function as a value. Fixed by tracking
+   each top-level function's arity in `generator.globals` (previously just
+   a set) and emitting the `fun/Arity` form when an identifier resolves to
+   one. The same lookup also closed a related gap in `callTarget`: a
+   built-in reached without its own argument list (`filter(arr, pred) |> len`)
+   wasn't checked against `builtinCalls`.
+
+Verified end-to-end: `calcium-lang`'s actual `array.ca`, compiled
+unmodified, runs `reverse`/`sum`/`sort`/`unique`/`take`/`find`/`zip`/
+`chunk`/`count` correctly on BEAM - including `sort`'s recursive quicksort
+and higher-order calls through `map`/`filter`/`reduce`.

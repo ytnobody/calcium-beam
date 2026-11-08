@@ -19,12 +19,29 @@ import (
 // moduleName. Top-level function declarations become Erlang functions;
 // every other top-level statement is collected into a generated main/0.
 func Module(moduleName string, program *ast.Program) (string, error) {
-	g := &generator{module: moduleName}
+	g := &generator{module: moduleName, globals: map[string]int{}}
+	for _, stmt := range program.Statements {
+		if fd, ok := stmt.(*ast.FunctionDeclaration); ok {
+			g.globals[fd.Name.Value] = len(fd.Parameters)
+		}
+	}
 	return g.renderModule(program)
 }
 
 type generator struct {
 	module string
+	// globals maps every top-level function name to its arity, collected
+	// before any body is compiled (functions may call each other regardless
+	// of declaration order, including recursively). Used two ways:
+	//   - callTarget: tell a call to a named Calcium function (-> an Erlang
+	//     atom call) apart from a call through a local variable/parameter
+	//     that happens to hold a fun (-> an Erlang variable call) - `fn(x)`
+	//     and `V_fn(x)` are different things in Erlang, unlike in Calcium.
+	//   - expr's Identifier case: tell a global function referenced as a
+	//     plain value (e.g. `reduce(arr, helper, [])`) apart from a local
+	//     variable - the former needs an explicit `fun 'helper'/Arity`
+	//     reference, which requires knowing the arity.
+	globals map[string]int
 }
 
 func (g *generator) renderModule(program *ast.Program) (string, error) {
@@ -136,6 +153,13 @@ func (g *generator) expr(e ast.Expression) (string, error) {
 	case *ast.StringLiteral:
 		return erlBinaryString(n.Value), nil
 	case *ast.Identifier:
+		// A reference to a global function used as a value (e.g.
+		// `reduce(arr, helper, [])`, passing `helper` itself rather than
+		// calling it) needs an explicit fun reference - plain `erlAtom(name)`
+		// in an expression position is a 0-ary call attempt, not a value.
+		if arity, ok := g.globals[n.Value]; ok {
+			return fmt.Sprintf("fun %s/%d", erlAtom(n.Value), arity), nil
+		}
 		return erlVar(n.Value), nil
 	case *ast.InfixExpression:
 		return g.infix(n)
@@ -178,6 +202,8 @@ func (g *generator) expr(e ast.Expression) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("{error, %s}", v), nil
+	case *ast.LambdaExpression:
+		return g.lambda(n)
 	default:
 		return "", fmt.Errorf("codegen: unsupported expression %T (later stage)", e)
 	}
@@ -297,6 +323,19 @@ func (g *generator) effectHandle(n *ast.EffectHandleExpression) (string, error) 
 		subject, erlVar(n.SuccessVar.Value), successBody, erlVar(n.FailureVar.Value), failureBody), nil
 }
 
+// lambda renders `(params) => body` as an Erlang anonymous fun.
+func (g *generator) lambda(n *ast.LambdaExpression) (string, error) {
+	params := make([]string, len(n.Parameters))
+	for i, p := range n.Parameters {
+		params[i] = erlVar(p.Value)
+	}
+	body, err := g.expr(n.Body)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("fun(%s) -> %s end", strings.Join(params, ", "), body), nil
+}
+
 func (g *generator) exprList(exprs []ast.Expression) ([]string, error) {
 	out := make([]string, len(exprs))
 	for i, e := range exprs {
@@ -397,7 +436,19 @@ func (g *generator) call(n *ast.CallExpression) (string, error) {
 func (g *generator) callTarget(fn ast.Expression) (string, error) {
 	switch f := fn.(type) {
 	case *ast.Identifier:
-		return erlAtom(f.Value), nil
+		if _, ok := g.globals[f.Value]; ok {
+			return erlAtom(f.Value), nil
+		}
+		// A global built-in reached as a pipe/call target without its own
+		// argument list, e.g. `filter(arr, pred) |> len` (len applied to
+		// the filtered result) - see call()'s identical check.
+		if target, ok := builtinCalls[f.Value]; ok {
+			return target, nil
+		}
+		// Not a known top-level function or built-in: a local
+		// variable/parameter that happens to hold a fun (e.g. `fn` in
+		// `func apply(fn, x) = fn(x)`).
+		return erlVar(f.Value), nil
 	case *ast.MemberExpression:
 		return g.stdlibTarget(f)
 	default:
@@ -456,6 +507,26 @@ var builtinCalls = map[string]string{
 	"head":      "calcium_builtins:head",
 	"tail":      "calcium_builtins:tail",
 	"to_string": "calcium_builtins:to_string",
+	"map":       "calcium_builtins:map",
+	"filter":    "calcium_builtins:filter",
+	"reduce":    "calcium_builtins:reduce",
+	"concat":    "calcium_builtins:concat",
+	"push":      "calcium_builtins:push",
+	"range":     "calcium_builtins:range",
+	"get":       "calcium_builtins:get",
+	// core.math's native primitives (math.ca calls these directly by name,
+	// not as module.function - see docs/DECISIONS.md D8). Delegates
+	// straight to Erlang's math module.
+	"__floor": "calcium_primitives:floor_",
+	"__ceil":  "calcium_primitives:ceil_",
+	"__round": "calcium_primitives:round_",
+	"__sqrt":  "calcium_primitives:sqrt_",
+	"__pow":   "calcium_primitives:pow_",
+	"__sin":   "calcium_primitives:sin_",
+	"__cos":   "calcium_primitives:cos_",
+	"__tan":   "calcium_primitives:tan_",
+	"__log":   "calcium_primitives:log_",
+	"__exp":   "calcium_primitives:exp_",
 }
 
 // isUpper reports whether a Calcium identifier is capitalized, the
@@ -482,26 +553,33 @@ func adtTuple(variant string, args []string) string {
 // Only literal, wildcard (`_`), and plain-binding patterns are supported in
 // stage 1; constructor/ADT patterns are a later stage once ADTs are mapped
 // to tagged tuples (docs/DECISIONS.md D3).
+// match renders a Calcium match expression. It wraps the case in an
+// immediately-invoked fun binding the subject to a fresh variable (rather
+// than inlining the subject expression into `case ... of`), so a "standard
+// case" arm (see matchCase) can refer to the subject's already-evaluated
+// value in a guard without re-evaluating a side-effecting subject twice.
 func (g *generator) match(n *ast.MatchExpression) (string, error) {
 	subject, err := g.expr(n.Subject)
 	if err != nil {
 		return "", err
 	}
+	subjectVar := "V__subject"
 
 	var arms []string
 	for _, c := range n.Cases {
-		arm, err := g.matchCase(c)
+		arm, err := g.matchCase(c, subjectVar)
 		if err != nil {
 			return "", err
 		}
 		arms = append(arms, arm)
 	}
 
-	return fmt.Sprintf("case %s of\n        %s\n    end", subject, strings.Join(arms, ";\n        ")), nil
+	return fmt.Sprintf("(fun(%s) -> case %s of\n        %s\n    end end)(%s)",
+		subjectVar, subjectVar, strings.Join(arms, ";\n        "), subject), nil
 }
 
-func (g *generator) matchCase(c *ast.MatchCase) (string, error) {
-	pattern, err := g.pattern(c.Pattern, c.IsDefault)
+func (g *generator) matchCase(c *ast.MatchCase, subjectVar string) (string, error) {
+	pattern, guard, err := g.matchPatternAndGuard(c, subjectVar)
 	if err != nil {
 		return "", err
 	}
@@ -511,14 +589,60 @@ func (g *generator) matchCase(c *ast.MatchCase) (string, error) {
 		return "", err
 	}
 
-	if c.Guard != nil {
-		guard, err := g.expr(c.Guard)
-		if err != nil {
-			return "", err
-		}
+	if guard != "" {
 		return fmt.Sprintf("%s when %s -> %s", pattern, guard, body), nil
 	}
 	return fmt.Sprintf("%s -> %s", pattern, body), nil
+}
+
+// matchPatternAndGuard renders a case's pattern, and an extra guard beyond
+// `c.Guard` when needed. The reference compiler (pkg/compiler/compiler.go's
+// compileMatch "standard case" branch) compiles any pattern that is not a
+// guard-clause binding, a ConstructorPattern, or `_` as an *expression* and
+// compares it for equality against the subject - so an arbitrary boolean
+// expression (`n < 0 => ...`) is valid pattern syntax, not just literals.
+// pattern() renders the subset that has a direct Erlang pattern shape;
+// anything else falls back to `_` with an equality guard against subjectVar.
+func (g *generator) matchPatternAndGuard(c *ast.MatchCase, subjectVar string) (pattern string, guard string, err error) {
+	if c.Guard != nil {
+		pattern, err = g.pattern(c.Pattern, c.IsDefault)
+		if err != nil {
+			return "", "", err
+		}
+		guard, err = g.expr(c.Guard)
+		if err != nil {
+			return "", "", err
+		}
+		return pattern, guard, nil
+	}
+
+	if isSimplePattern(c.Pattern) || c.IsDefault {
+		pattern, err = g.pattern(c.Pattern, c.IsDefault)
+		if err != nil {
+			return "", "", err
+		}
+		return pattern, "", nil
+	}
+
+	exprSrc, err := g.expr(c.Pattern)
+	if err != nil {
+		return "", "", fmt.Errorf("codegen: unsupported match pattern %T (later stage): %w", c.Pattern, err)
+	}
+	return "_", fmt.Sprintf("(%s) =:= %s", exprSrc, subjectVar), nil
+}
+
+// isSimplePattern reports whether p has a direct Erlang pattern
+// representation via pattern(), as opposed to needing the equality-guard
+// fallback in matchPatternAndGuard.
+func isSimplePattern(p ast.Expression) bool {
+	switch p.(type) {
+	case *ast.WildcardExpression, *ast.Identifier,
+		*ast.IntegerLiteral, *ast.FloatLiteral, *ast.BooleanLiteral, *ast.StringLiteral,
+		*ast.PrefixExpression, *ast.ConstructorPattern, *ast.ArrayLiteral, *ast.TupleLiteral:
+		return true
+	default:
+		return false
+	}
 }
 
 // pattern renders a match arm's pattern. A bare identifier binds (Erlang
@@ -592,8 +716,15 @@ func isWildcard(e ast.Expression) bool {
 // erlAtom lowercases and sanitizes a Calcium identifier for use as an Erlang
 // atom (function/module name). Calcium names are already lowercase by
 // convention, so this currently only guards against reserved characters.
+// erlAtom renders a Calcium function/module name as an Erlang atom. Always
+// single-quoted: an unquoted atom has real restrictions an ordinary Calcium
+// identifier can violate without looking unusual at all - leading
+// underscore is lexed as a *variable*, not an atom, which is exactly what
+// calcium-lang's own array.ca's private helpers (`_min`, `_reverse_fn`, ...)
+// do; quoting sidesteps the whole restriction instead of special-casing it.
 func erlAtom(name string) string {
-	return strings.ReplaceAll(name, "-", "_")
+	name = strings.ReplaceAll(name, "-", "_")
+	return "'" + strings.ReplaceAll(name, "'", "\\'") + "'"
 }
 
 // erlVar renders a Calcium identifier as an Erlang variable: capitalize the
