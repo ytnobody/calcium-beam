@@ -496,3 +496,146 @@ func TestHeadTailMaybeSemantics(t *testing.T) {
 		t.Errorf("unexpected output:\n%s", runOut)
 	}
 }
+
+// --- Secret/capability (D16) ---
+
+func TestSecretWrapAndMap(t *testing.T) {
+	out := compile(t, `s = Secret.wrap("x");
+func id(v) = v;
+r = Secret.map(s, id);`)
+	if !strings.Contains(out, `V_s = calcium_secret:wrap(<<"x"/utf8>>)`) {
+		t.Errorf("expected Secret.wrap dispatch:\n%s", out)
+	}
+	if !strings.Contains(out, "V_r = calcium_secret:map(V_s, fun 'id'/1)") {
+		t.Errorf("expected Secret.map dispatch:\n%s", out)
+	}
+}
+
+func TestSecretMapRejectsEffectFunctionAtCompileTime(t *testing.T) {
+	l := lexer.New(`func! leaky(x) = x;
+s = Secret.wrap("x");
+r = Secret.map(s, leaky);`)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if errs := p.Errors(); len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	_, err := Module("test", program)
+	if err == nil || !strings.Contains(err.Error(), "leaky") {
+		t.Fatalf("expected a compile error naming the effect function, got %v", err)
+	}
+}
+
+func TestSecretCapability(t *testing.T) {
+	out := compile(t, `cap = Secret.capability(test.secret_sink, {scope: "x"});`)
+	if !strings.Contains(out, `V_cap = calcium_secret:capability(<<"test.secret_sink"/utf8>>, #{<<"scope"/utf8>> => <<"x"/utf8>>})`) {
+		t.Errorf("expected Secret.capability dispatch with the derived sink name:\n%s", out)
+	}
+}
+
+// TestPlainPipeAllowsSecret documents a finding from verifying against
+// the real reference binary (D16): plain `|>` is never checked for a
+// Secret operand - only `!>`/`!!!>` are, since a pure function has no
+// effect boundary to leak through. Confirmed empirically before
+// implementing, not assumed from the opcode table.
+func TestPlainPipeAllowsSecret(t *testing.T) {
+	out := compile(t, `s = Secret.wrap("x");
+func noop(v) = v;
+r = s |> noop;`)
+	if !strings.Contains(out, "V_r = 'noop'(V_s)") {
+		t.Errorf("expected plain pipe to compile without rejecting the Secret:\n%s", out)
+	}
+}
+
+// TestEffectPipeRejectsSecretWithoutAuthorization is a regression test
+// for the one case that *is* rejected: `!>` (not `!!!>`) with a
+// Secret-shaped left side - confirmed against the reference to produce
+// exactly this error message.
+func TestEffectPipeRejectsSecretWithoutAuthorization(t *testing.T) {
+	l := lexer.New(`use core.io!;
+s = Secret.wrap("x");
+s !> io.say;`)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if errs := p.Errors(); len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	_, err := Module("test", program)
+	if err == nil || !strings.Contains(err.Error(), "!!!>") {
+		t.Fatalf("expected a compile error pointing at '!!!>', got %v", err)
+	}
+}
+
+// TestSecretEndToEnd compiles and runs the full Secret/capability
+// pipeline on real BEAM: wrap, equality (never comparing payloads),
+// to_string redaction, Secret.capability/.with/!!!>, and the
+// CALCIUM_SECRET_WRITE_ALLOW gate (both denied and allowed) - mirroring
+// each fixture verified against the real reference binary in D16's
+// design and this stage's implementation. test.secret_sink is a
+// test-only placeholder (calciumbeam has no real HTTP/process
+// primitives to back a trusted sink yet).
+func TestSecretEndToEnd(t *testing.T) {
+	erlc, err := exec.LookPath("erlc")
+	if err != nil {
+		t.Skip("erlc not found, skipping end-to-end BEAM compile check")
+	}
+	erl, err := exec.LookPath("erl")
+	if err != nil {
+		t.Skip("erl not found, skipping end-to-end BEAM compile check")
+	}
+
+	out := compile(t, `use core.io!;
+s = Secret.wrap("hello");
+to_string(s) !> io.say;
+w1 = Secret.wrap("hello");
+w2 = Secret.wrap("hello");
+to_string(w1 == w2) !> io.say;
+to_string(w1 == w1) !> io.say;
+cap = Secret.capability(test.secret_sink, {scope: "x"});
+result = Secret.with(cap) {
+    s !!!> test.secret_sink({scope: "x"})
+};
+to_string(result) !> io.say;`)
+
+	dir := t.TempDir()
+	erlPath := filepath.Join(dir, "test.erl")
+	if err := os.WriteFile(erlPath, []byte(out), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", "erl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(erlc, "-o", dir,
+		filepath.Join(repoRoot, "calcium_secret.erl"),
+		filepath.Join(repoRoot, "calcium_io_native.erl"),
+		filepath.Join(repoRoot, "calcium_builtins.erl"),
+		erlPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("erlc failed: %v\n%s", err, out)
+	}
+
+	// Denied: CALCIUM_SECRET_WRITE_ALLOW unset.
+	deniedCmd := exec.Command(erl, "-noshell", "-pa", dir, "-eval", "test:main(), halt().")
+	deniedCmd.Env = append(os.Environ(), "CALCIUM_SECRET_WRITE_ALLOW=")
+	deniedOut, _ := deniedCmd.CombinedOutput()
+	if !strings.Contains(string(deniedOut), "secret_write_denied") {
+		t.Errorf("expected denial without CALCIUM_SECRET_WRITE_ALLOW set:\n%s", deniedOut)
+	}
+
+	// Allowed: CALCIUM_SECRET_WRITE_ALLOW set.
+	allowedCmd := exec.Command(erl, "-noshell", "-pa", dir, "-eval", "test:main(), halt().")
+	allowedCmd.Env = append(os.Environ(), "CALCIUM_SECRET_WRITE_ALLOW=entry")
+	allowedOut, err := allowedCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("erl run failed: %v\n%s", err, allowedOut)
+	}
+	got := string(allowedOut)
+	if !strings.Contains(got, "<secret>\nfalse\ntrue\n") {
+		t.Errorf("expected redacted display and reference-identity equality:\n%s", got)
+	}
+	if !strings.Contains(got, "success(") || !strings.Contains(got, "test_sink_received") {
+		t.Errorf("expected the trusted sink to run once authorized:\n%s", got)
+	}
+}

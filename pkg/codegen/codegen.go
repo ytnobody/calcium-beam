@@ -19,10 +19,13 @@ import (
 // moduleName. Top-level function declarations become Erlang functions;
 // every other top-level statement is collected into a generated main/0.
 func Module(moduleName string, program *ast.Program) (string, error) {
-	g := &generator{module: moduleName, globals: map[string]int{}}
+	g := &generator{module: moduleName, globals: map[string]int{}, effectFuncs: map[string]bool{}, secretVars: map[string]bool{}}
 	for _, stmt := range program.Statements {
 		if fd, ok := stmt.(*ast.FunctionDeclaration); ok {
 			g.globals[fd.Name.Value] = len(fd.Parameters)
+			if fd.IsEffect {
+				g.effectFuncs[fd.Name.Value] = true
+			}
 		}
 	}
 	return g.renderModule(program)
@@ -42,6 +45,19 @@ type generator struct {
 	//     variable - the former needs an explicit `fun 'helper'/Arity`
 	//     reference, which requires knowing the arity.
 	globals map[string]int
+	// effectFuncs is the subset of globals declared `func!`, collected
+	// alongside globals. Used for Secret.map's compile-time purity check
+	// (D16): matches the reference's own best-effort heuristic exactly
+	// (a direct reference to a known func! function is rejected; a
+	// lambda isn't, since there's no static way to tell).
+	effectFuncs map[string]bool
+	// secretVars is D16's port of the reference's isSecretExpr taint
+	// tracking: a variable name assigned a Secret-shaped expression
+	// (Secret.wrap(...)/Secret.map(...), or built from one). Used by
+	// pipe() to reject `secret !> effectFn` the same way the reference
+	// does - a syntactic heuristic, not real taint tracking, matching
+	// the reference's own known gap rather than introducing a new one.
+	secretVars map[string]bool
 }
 
 func (g *generator) renderModule(program *ast.Program) (string, error) {
@@ -129,6 +145,7 @@ func (g *generator) statement(stmt ast.Statement) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		g.secretVars[s.Name.Value] = g.isSecretExpr(s.Value)
 		return fmt.Sprintf("%s = %s", erlVar(s.Name.Value), val), nil
 	default:
 		return "", fmt.Errorf("codegen: unsupported top-level statement %T", stmt)
@@ -233,7 +250,19 @@ func (g *generator) expr(e ast.Expression) (string, error) {
 	case *ast.PipeExpression:
 		return g.pipe(n.Left, n.Right)
 	case *ast.EffectPipeExpression:
-		// Treated identically to `|>` for now - see the func! note in
+		// A Secret may only cross `!>` via the secret-authorized `!!!>`
+		// (AllowSecret) - verified directly against the reference (D16):
+		// plain `|>` is never checked (pure functions have no effect
+		// boundary to leak through), only `!>`/`!!!>`. isSecretExpr is a
+		// syntactic heuristic, matching the reference's own known gap
+		// (not full taint tracking), not introducing a new one.
+		if !n.AllowSecret && g.isSecretExpr(n.Left) {
+			return "", fmt.Errorf("codegen: Secret cannot be passed to '!>'; use the secret-authorized '!!!>' pipeline")
+		}
+		if n.AllowSecret {
+			return g.secretPipe(n.Left, n.Right)
+		}
+		// Otherwise treated identically to `|>` - see the func! note in
 		// functionDecl and docs/DECISIONS.md D5 for the deferred
 		// success/failure wrapping this skips.
 		return g.pipe(n.Left, n.Right)
@@ -241,6 +270,8 @@ func (g *generator) expr(e ast.Expression) (string, error) {
 		return g.effectHandle(n)
 	case *ast.StayExpression:
 		return g.stay(n)
+	case *ast.SecretWithExpression:
+		return g.secretWith(n)
 	case *ast.MemberExpression:
 		return g.stdlibValue(n)
 	case *ast.SuccessExpression:
@@ -365,6 +396,146 @@ func (g *generator) stay(n *ast.StayExpression) (string, error) {
 
 	return fmt.Sprintf("{ok, (fun() -> InitialState = #{%s}, %s end)()}",
 		strings.Join(pairs, ", "), strings.Join(stmts, ", ")), nil
+}
+
+// secretWith renders `Secret.with(cap) { body }` as
+// calcium_secret:with/2 - a try/after wrapping the body so the
+// capability stack unwinds correctly even if the body throws, the same
+// guarantee the reference gets from truncating vm.secretCaps at frame
+// return (D16). No tail-position caution is needed here the way the
+// reference compiler needs one for its own final expression (so that
+// OpSecretWithEnd isn't skipped by a tail call) - calcium_secret:with/2's
+// `after` clause runs regardless of how Body() returns, structurally.
+func (g *generator) secretWith(n *ast.SecretWithExpression) (string, error) {
+	capSrc, err := g.expr(n.Capability)
+	if err != nil {
+		return "", err
+	}
+
+	stmts := make([]string, 0, len(n.Statements)+1)
+	for _, s := range n.Statements {
+		src, err := g.statement(s)
+		if err != nil {
+			return "", err
+		}
+		stmts = append(stmts, src)
+	}
+	final, err := g.expr(n.FinalExpression)
+	if err != nil {
+		return "", err
+	}
+	stmts = append(stmts, final)
+
+	return fmt.Sprintf("calcium_secret:with(%s, fun() -> %s end)", capSrc, strings.Join(stmts, ", ")), nil
+}
+
+// secretCall renders Secret.wrap/.map/.capability - special syntax in
+// the reference compiler, not plain calls (D16).
+func (g *generator) secretCall(property string, rawArgs []ast.Expression, args []string) (string, error) {
+	switch property {
+	case "wrap":
+		if len(args) != 1 {
+			return "", fmt.Errorf("codegen: Secret.wrap expects exactly 1 argument, got %d", len(args))
+		}
+		return fmt.Sprintf("calcium_secret:wrap(%s)", args[0]), nil
+	case "map":
+		if len(args) != 2 {
+			return "", fmt.Errorf("codegen: Secret.map expects exactly 2 arguments, got %d", len(args))
+		}
+		// Compile-time purity check, matching the reference's own
+		// best-effort heuristic exactly (isEffectExpression): only a
+		// direct reference to a known func! function is rejected; a
+		// lambda isn't, since there's no static way to tell (and unlike
+		// the reference, no runtime check backs this up either - D16
+		// limitation #1).
+		if ident, ok := rawArgs[1].(*ast.Identifier); ok && g.effectFuncs[ident.Value] {
+			return "", fmt.Errorf("codegen: Secret.map: callback must be a pure function, got effect function %q", ident.Value)
+		}
+		return fmt.Sprintf("calcium_secret:map(%s, %s)", args[0], args[1]), nil
+	case "capability":
+		if len(rawArgs) != 2 {
+			return "", fmt.Errorf("codegen: Secret.capability expects exactly 2 arguments (sink, scope), got %d", len(rawArgs))
+		}
+		sinkName, err := g.secretSinkName(rawArgs[0])
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("calcium_secret:capability(%s, %s)", erlBinaryString(sinkName), args[1]), nil
+	default:
+		return "", fmt.Errorf("codegen: Secret.%s is not implemented (later stage)", property)
+	}
+}
+
+// secretSinkName derives a stable name from a sink function reference's
+// syntactic identity, mirroring the reference's secretSinkName -
+// simplified to not need local-function scope/index disambiguation,
+// since every sink in this implementation's scope is a module-level
+// reference (D16), not a local closure.
+func (g *generator) secretSinkName(expr ast.Expression) (string, error) {
+	switch e := expr.(type) {
+	case *ast.Identifier:
+		return e.Value, nil
+	case *ast.MemberExpression:
+		if obj, ok := e.Object.(*ast.Identifier); ok {
+			return obj.Value + "." + e.Property.Value, nil
+		}
+	case *ast.CallExpression:
+		return g.secretSinkName(e.Function)
+	}
+	return "", fmt.Errorf("codegen: Secret capability sink must be a named function, got %T", expr)
+}
+
+// secretPipe renders `secret !!!> sink(scope)` - checks the current
+// Secret.with capability stack (via the process dictionary, D16) and
+// the CALCIUM_SECRET_WRITE_ALLOW host policy gate before calling the
+// sink, mirroring OpCheckSecretCapability/OpAllowSecretCall and
+// isModuleAllowed (collapsed to program-level - no multi-module linking
+// exists yet).
+func (g *generator) secretPipe(left, right ast.Expression) (string, error) {
+	var sinkExpr ast.Expression = right
+	if call, ok := right.(*ast.CallExpression); ok {
+		sinkExpr = call.Function
+	}
+	sinkName, err := g.secretSinkName(sinkExpr)
+	if err != nil {
+		return "", err
+	}
+	callSrc, err := g.pipe(left, right)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("calcium_secret:check_and_call(%s, fun() -> %s end)", erlBinaryString(sinkName), callSrc), nil
+}
+
+// isSecretExpr is D16's port of the reference's syntactic heuristic
+// (pkg/compiler/compiler.go's isSecretExpr): recognizes Secret.wrap/.map
+// shapes and secretVars, the same shapes the reference checks - not full
+// taint tracking, matching its own known gap rather than introducing a
+// new one.
+func (g *generator) isSecretExpr(expr ast.Expression) bool {
+	switch e := expr.(type) {
+	case *ast.Identifier:
+		return g.secretVars[e.Value]
+	case *ast.CallExpression:
+		if m, ok := e.Function.(*ast.MemberExpression); ok {
+			if obj, ok := m.Object.(*ast.Identifier); ok && obj.Value == "Secret" {
+				return m.Property.Value == "wrap" || m.Property.Value == "map"
+			}
+		}
+	case *ast.ArrayLiteral:
+		for _, el := range e.Elements {
+			if g.isSecretExpr(el) {
+				return true
+			}
+		}
+	case *ast.TupleLiteral:
+		for _, el := range e.Elements {
+			if g.isSecretExpr(el) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // pipe renders `x |> f` / `x |> f(y)` as `f(x)` / `f(x, y)` - the pipe
@@ -533,6 +704,14 @@ func (g *generator) call(n *ast.CallExpression) (string, error) {
 		if obj, ok := m.Object.(*ast.Identifier); ok && isUpper(obj.Value) && isUpper(m.Property.Value) {
 			return adtTuple(m.Property.Value, args), nil
 		}
+		// Secret.wrap/.map/.capability are special syntax in the reference
+		// compiler, not plain calls (D16) - checked before the generic
+		// method-call fallback below, since "Secret" isn't a
+		// stdlibModuleObjects entry and would otherwise fall through to
+		// invoke/3.
+		if obj, ok := m.Object.(*ast.Identifier); ok && obj.Value == "Secret" {
+			return g.secretCall(m.Property.Value, n.Arguments, args)
+		}
 		// A method call (`handler.ready()`) on a value whose shape isn't
 		// known until runtime - same reasoning as prop/invoke in
 		// stdlibValue, dispatched through calcium_builtins:invoke/3. Only
@@ -675,6 +854,11 @@ var stdlibCalls = map[string]string{
 	// core.schedule (D14/D15).
 	"schedule.timeout":  "calcium_schedule:timeout_",
 	"schedule.interval": "calcium_schedule:interval_",
+	// Secret's test-only trusted sink (D16) - not a real primitive;
+	// calciumbeam has no HTTP/process primitives to back a real one yet.
+	// Exists only so Secret.capability/.with/!!!>'s gating machinery has
+	// something to call end-to-end in tests.
+	"test.secret_sink": "calcium_secret:test_sink",
 }
 
 // stdlibModuleObjects is every core.* module name, not just the ones

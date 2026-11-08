@@ -28,6 +28,12 @@ to_string(true) -> <<"true">>;
 to_string(false) -> <<"false">>;
 to_string({ok, V}) -> <<"success(", (to_string(V))/binary, ")">>;
 to_string({error, V}) -> <<"failure(", (to_string(V))/binary, ")">>;
+%% Never render a Secret's payload - matching pkg/value/value.go's
+%% String() for TYPE_SECRET exactly (always "<secret>", regardless of
+%% what's wrapped). This is the one property a differential check can
+%% actually verify directly (see docs/DECISIONS.md D16).
+to_string({secret, _}) -> <<"<secret>">>;
+to_string({secret_capability, _, _}) -> <<"<secret capability>">>;
 to_string(X) when is_list(X) ->
     Strs = lists:map(fun to_string/1, X),
     <<"[", (iolist_to_binary(lists:join(<<", ">>, Strs)))/binary, "]">>;

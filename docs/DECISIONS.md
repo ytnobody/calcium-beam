@@ -413,3 +413,90 @@ down. `async_handler.ca`/`async_cancel.ca`/`async_timeout.ca`/
 4. `async.cancel` only handles a Handler, not a Task.
 5. `task.done` (an EventSource for `expects`/`stay`), stdin/EOF sources,
    and channel-backed event sources aren't implemented.
+
+## D16 - Stage 5: Secret/capability (decided, design-first per the earlier agreement)
+
+Implemented per the session's own plan, written before any code from
+reading `pkg/value/value.go`'s Secret/SecretCapability types and
+`pkg/vm/vm.go`'s opcodes/host policy directly - not assumed from the
+opcode table. No calcium-lang example or test exercises Secret at all
+(checked), so every claim below was additionally verified against the
+real reference binary with hand-written fixtures before implementing
+the calcium-beam side, not just read off the Go source.
+
+- Secret equality is pointer identity, not a timing-safe comparison
+  algorithm. `value.go`'s `SecretVal` allocates a fresh `*Secret` per
+  call; `Equals` is a bare Go pointer compare. Confirmed directly:
+  `Secret.wrap("hello") == Secret.wrap("hello")` is `false` on the
+  reference binary, `w1 == w1` is `true`. There's no payload-comparison
+  timing surface to defend against in the first place, because the
+  payload is never looked at - `{secret, Ref}` with `Ref1 =:= Ref2`
+  reproduces this exactly (an ETS-backed opaque value, same pattern as
+  Handler/Task in D15).
+- `to_string` renders `<secret>`, never the payload - the one property a
+  differential-style check can actually verify directly. Added to
+  `calcium_builtins:to_string/1`, and `calcium_io_native:say`/`print`
+  already delegate to it (D13), so `io.say`ing a Secret is covered too.
+- **`Secret.capability`/`!>`'s Secret check are both special syntax, not
+  ordinary calls** - confirmed by reading `pkg/compiler/compiler.go`
+  directly: `Secret.capability(sinkFn, scope)`'s first argument is
+  compiled as a *derived name string* (`secretSinkName`), never
+  evaluated as a value, and the same derivation is applied to `!!!>`'s
+  right-hand side so the two match. Replicated with a simplified
+  `secretSinkName` in `pkg/codegen` (no local-function scope/index
+  disambiguation needed - every sink in this implementation's scope is
+  a module-level reference, not a local closure).
+- **Verified directly against the reference, and it contradicted my own
+  working assumption**: plain `|>` is *never* checked for a Secret
+  operand - only `!>`/`!!!>` are (`isSecretExpr` is called exclusively
+  from the `EffectPipeExpression` compile path, three call sites, zero
+  in `PipeExpression`'s). `s |> noop` runs cleanly on the reference;
+  `s !> io.say` is rejected with "Secret cannot be passed to '!>'; use
+  the secret-authorized '!!!>' pipeline". Implemented to match exactly -
+  `pipe()` itself needed no change; the check lives only in the
+  `EffectPipeExpression` case before it delegates to `pipe()`.
+- `Secret.with(cap) { body }` pushes/pops the process dictionary's
+  `secret_caps` stack via `try ... after ... end`, giving the same
+  unwind guarantee the reference gets from truncating `vm.secretCaps` at
+  frame return (`vm.go` ~line 491-501) - not something added to
+  approximate that guarantee, a structural consequence of `after`.
+- `!!!>` (`calcium_secret:check_and_call/2`) checks the capability stack
+  for a matching sink name *and* `CALCIUM_SECRET_WRITE_ALLOW`
+  (deny-by-default) before calling the sink. Verified end-to-end in all
+  three directions: denied with the env var unset, denied with a
+  mismatched capability sink name even with the env var set, allowed
+  with both a matching capability and the env var set.
+- **`Secret.capability`'s "entry module only" check and
+  `CALCIUM_SECRET_WRITE_ALLOW`'s module-ID matching both collapse to
+  program-level**, since `calciumbeam` has no multi-module linking (D8
+  compiles separate single-file programs, never one program importing
+  another's compiled code) - every compiled program trivially *is* the
+  only module. Documented as a collapsed check, not silently dropped;
+  revisit if multi-module linking is ever added.
+
+### A real, net gap relative to the reference (not glossed over)
+
+`Secret.map`'s purity check in the reference is both a compile-time
+heuristic (`isEffectExpression`, direct reference to a known `func!`
+function - rejects, returns `(false, false)` "can't determine" for a
+lambda) *and* a separate runtime check (`vm.isEffectValue(fn)` in
+`OpSecretMap`, which inspects a closure's `IsEffect` flag and *does*
+catch a lambda wrapping an effect call). This implementation replicates
+only the compile-time half (`effectFuncs` tracking + a check in
+`secretCall`'s `"map"` case) - compiled Erlang closures are plain funs
+with no equivalent flag, so **a lambda passed to `Secret.map` that
+itself calls an effect function is not rejected here**, where the
+reference's runtime check would catch it. This is specifically narrower
+than the reference for that one shape, not a parity claim.
+
+### Other known limitations
+
+- No real trusted sink. `erl/calcium_secret.erl`'s `test_sink/2`
+  (dispatched as `test.secret_sink` in `stdlibCalls`) exists only to
+  verify the capability-gating machinery end-to-end - it is explicitly
+  not real I/O, and `calciumbeam` has no HTTP/process-spawning
+  primitives yet to back `http.post_secret`/`os.proc_write_secret`.
+- `isSecretExpr`'s syntactic heuristic (ported directly) has the same
+  gaps the reference's own version has - not full taint tracking,
+  defeated by passing a Secret through an untracked intermediate call in
+  both implementations equally.
