@@ -68,6 +68,12 @@ func (g *generator) renderModule(program *ast.Program) (string, error) {
 			// or pattern is just a tagged tuple, built/matched by name. See
 			// docs/DECISIONS.md D3.
 			continue
+		case *ast.NamespaceDeclaration:
+			// `namespace bytes;` (core.bytes.ca) only affects how callers
+			// qualify a call (bytes.to_bytes(...)); codegen dispatches
+			// module.function calls by name regardless (D6), so there's
+			// nothing to emit.
+			continue
 		default:
 			src, err := g.statement(stmt)
 			if err != nil {
@@ -494,9 +500,9 @@ func describeExpr(e ast.Expression) string {
 // stdlibCalls maps `module.function` to its erl/ implementation. Populated
 // incrementally as stages add stdlib coverage; see erl/calcium_io.erl.
 var stdlibCalls = map[string]string{
-	"io.say":     "calcium_io:say",
-	"io.println": "calcium_io:say",
-	"io.print":   "calcium_io:print",
+	"io.say":     "calcium_io_native:say",
+	"io.println": "calcium_io_native:say",
+	"io.print":   "calcium_io_native:print",
 }
 
 // builtinCalls maps a global built-in function name (no module qualifier) to
@@ -527,6 +533,26 @@ var builtinCalls = map[string]string{
 	"__tan":   "calcium_primitives:tan_",
 	"__log":   "calcium_primitives:log_",
 	"__exp":   "calcium_primitives:exp_",
+	// core.string's native primitives (string.ca calls these directly by
+	// name too - see docs/DECISIONS.md D6/the plan's stage 1 entry).
+	"__str_len":         "calcium_str_native:len",
+	"__str_split":       "calcium_str_native:split",
+	"__str_join":        "calcium_str_native:join",
+	"__str_trim":        "calcium_str_native:trim",
+	"__str_upper":       "calcium_str_native:upper",
+	"__str_lower":       "calcium_str_native:lower",
+	"__str_replace":     "calcium_str_native:replace",
+	"__str_substring":   "calcium_str_native:substring",
+	"__str_char_at":     "calcium_str_native:char_at",
+	"__str_from_code":   "calcium_str_native:from_code",
+	"__str_index_of":    "calcium_str_native:index_of",
+	"__str_starts_with": "calcium_str_native:starts_with",
+	"__str_ends_with":   "calcium_str_native:ends_with",
+	"__str_contains":    "calcium_str_native:contains",
+	"__str_to_bytes":    "calcium_str_native:to_bytes",
+	"__str_from_bytes":  "calcium_str_native:from_bytes",
+	"__int_to_bytes":    "calcium_primitives:int_to_bytes",
+	"__float_to_bytes":  "calcium_primitives:float_to_bytes",
 }
 
 // isUpper reports whether a Calcium identifier is capitalized, the

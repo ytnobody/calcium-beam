@@ -1,7 +1,7 @@
 %% Erlang/OTP support for Calcium's core.io module (Stage 3 subset).
 %% See ../docs/DECISIONS.md D6 for the module.function -> erl/ dispatch
 %% convention this file participates in.
--module(calcium_io).
+-module(calcium_io_native).
 -export([say/1, print/1]).
 
 %% io.say/io.println both print a value followed by a newline.

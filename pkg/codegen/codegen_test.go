@@ -199,8 +199,8 @@ x = 5 |> double;
 	if !strings.Contains(out, "'double'(5)") {
 		t.Errorf("expected pipe desugared to a call:\n%s", out)
 	}
-	if !strings.Contains(out, `calcium_io:say(<<"hi"/utf8>>)`) {
-		t.Errorf("expected effect pipe dispatched to calcium_io:say:\n%s", out)
+	if !strings.Contains(out, `calcium_io_native:say(<<"hi"/utf8>>)`) {
+		t.Errorf("expected effect pipe dispatched to calcium_io_native:say:\n%s", out)
 	}
 }
 
@@ -277,7 +277,7 @@ to_string(sum([1, 2, 3, 4])) !> io.say;`)
 		t.Fatal(err)
 	}
 	cmd := exec.Command(erlc, "-o", dir,
-		filepath.Join(repoRoot, "calcium_io.erl"),
+		filepath.Join(repoRoot, "calcium_io_native.erl"),
 		filepath.Join(repoRoot, "calcium_builtins.erl"),
 		filepath.Join(dir, "test.erl"),
 	)
@@ -407,6 +407,38 @@ func TestCalciumLangMathCaEndToEnd(t *testing.T) {
 		t.Fatalf("erl run failed: %v\n%s", err, runOut)
 	}
 	if !strings.Contains(string(runOut), "5 -1 10") {
+		t.Errorf("unexpected output:\n%s", runOut)
+	}
+}
+
+func TestCalciumLangStringCaEndToEnd(t *testing.T) {
+	dir, _, erl := compileStdlibFile(t, "pkg/vm/stdlib/core/string.ca", "calcium_string", "calcium_str_native.erl", "calcium_builtins.erl")
+
+	runOut, err := exec.Command(erl, "-noshell", "-pa", dir, "-eval",
+		`io:format("~p ~p ~p~n", [calcium_string:reverse(<<"hello">>), calcium_string:words(<<"  a b  ">>), calcium_string:pad_left(<<"1">>, 3, <<"0">>)]), halt().`).CombinedOutput()
+	if err != nil {
+		t.Fatalf("erl run failed: %v\n%s", err, runOut)
+	}
+	// reverse relies on __str_split(s, "") splitting into individual code
+	// points - see docs/DECISIONS.md D11: Erlang's string:split doesn't
+	// special-case an empty separator the way Go's strings.Split does.
+	if !strings.Contains(string(runOut), `<<"olleh">> [<<"a">>,<<"b">>] <<"001">>`) {
+		t.Errorf("unexpected output:\n%s", runOut)
+	}
+}
+
+func TestCalciumLangBytesCaEndToEnd(t *testing.T) {
+	dir, _, erl := compileStdlibFile(t, "pkg/vm/stdlib/core/bytes.ca", "calcium_bytes",
+		"calcium_str_native.erl", "calcium_primitives.erl", "calcium_builtins.erl")
+
+	runOut, err := exec.Command(erl, "-noshell", "-pa", dir, "-eval",
+		`io:format("~p ~p~n", [calcium_bytes:to_bytes(<<"AB">>), calcium_bytes:from_int(1)]), halt().`).CombinedOutput()
+	if err != nil {
+		t.Fatalf("erl run failed: %v\n%s", err, runOut)
+	}
+	// io:format's ~p prints a list of printable ASCII bytes as a quoted
+	// string ("AB"), not [65,66] - cosmetic, not a value difference.
+	if !strings.Contains(string(runOut), `"AB" [0,0,0,0,0,0,0,1]`) {
 		t.Errorf("unexpected output:\n%s", runOut)
 	}
 }

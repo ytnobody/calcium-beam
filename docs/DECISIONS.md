@@ -149,3 +149,47 @@ Verified end-to-end: `calcium-lang`'s actual `array.ca`, compiled
 unmodified, runs `reverse`/`sum`/`sort`/`unique`/`take`/`find`/`zip`/
 `chunk`/`count` correctly on BEAM - including `sort`'s recursive quicksort
 and higher-order calls through `map`/`filter`/`reduce`.
+
+## D11 — Plan item 1 complete: `core.string` native primitives (**decided**)
+
+Added `erl/calcium_str_native.erl` covering all 15 `__str_*` primitives in
+`specs/ffi-primitives.md` §3.3, dispatched via `builtinCalls` (D6), plus
+`__int_to_bytes`/`__float_to_bytes` (`erl/calcium_primitives.erl`) for
+`core.bytes`. Two things diverged from a direct Go→Erlang port:
+
+- **Module naming collided with the D9 hazard, one level deeper.**
+  Compiling `string.ca` produces a module named `calcium_string` -
+  *correctly* avoiding the OTP `string` module per D9's `calcium_`
+  prefix, but that's exactly the name this plan item's own hand-written
+  support module would otherwise have used. Same latent collision for
+  `io.ca` → `calcium_io`. Renamed the support modules to
+  `calcium_str_native`/`calcium_io_native` (and the erl/ builtins/
+  primitives modules are safe only because no stdlib file is literally
+  named `builtins.ca`/`primitives.ca` - worth remembering before adding
+  another hand-written support module).
+- **`__str_split(s, "")` needed a real behavioral fix, not just a
+  translation.** `string.ca`'s `reverse` and `words` both rely on
+  splitting a string into individual characters via an empty separator -
+  which is Go's `strings.Split` special-casing an empty pattern to split
+  by rune. Erlang's `string:split/3` does not special-case this the same
+  way (it returns the whole string unsplit), so `reverse("hello")` was
+  silently a no-op until `split/2` got an explicit `<<>>` clause that
+  splits via `unicode:characters_to_list/1` into one-codepoint binaries.
+
+Verified end-to-end (now a permanent test,
+`TestCalciumLangStringCaEndToEnd`): `calcium-lang`'s actual `string.ca`,
+unmodified, correctly handles multi-byte Unicode (`len`/`char_at`/
+`reverse` on `"aアb😀"` all code-point correct, not byte-based) as well as
+`split`/`join`/`substring`/`starts_with`/`pad_left`/`words`/etc.
+
+## D12 — `namespace` declarations are a no-op, like `use` and `type` (**decided**)
+
+`core.bytes.ca` opens with `namespace bytes;`, a statement type
+(`*ast.NamespaceDeclaration`) not covered by any existing case. It only
+affects how *callers* qualify a call (`bytes.to_bytes(...)`); since D6
+dispatches `module.function` calls by name regardless of how the module
+was declared or imported, there is nothing to emit. Verified end-to-end
+(`TestCalciumLangBytesCaEndToEnd`): `calcium-lang`'s actual `bytes.ca`
+compiles and its `to_bytes`/`from_bytes`/`byte_len`/`char_count`/
+`from_int`/`from_float` all run correctly on BEAM, completing the
+`core.{math,array,string,bytes}` stdlib coverage from plan item 1.
