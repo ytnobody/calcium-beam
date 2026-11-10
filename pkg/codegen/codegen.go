@@ -13,13 +13,18 @@ import (
 	"strings"
 
 	"github.com/ytnobody/calcium-lang/pkg/ast"
+	"github.com/ytnobody/calcium-lang/pkg/lexer"
+	"github.com/ytnobody/calcium-lang/pkg/parser"
 )
 
 // Module renders a Calcium program as a single Erlang module named
 // moduleName. Top-level function declarations become Erlang functions;
 // every other top-level statement is collected into a generated main/0.
-func Module(moduleName string, program *ast.Program) (string, error) {
+func Module(moduleName string, program *ast.Program, opts ...Option) (string, error) {
 	g := &generator{module: moduleName, globals: map[string]int{}, effectFuncs: map[string]bool{}, secretVars: map[string]bool{}}
+	for _, opt := range opts {
+		opt(g)
+	}
 	for _, stmt := range program.Statements {
 		if fd, ok := stmt.(*ast.FunctionDeclaration); ok {
 			g.globals[fd.Name.Value] = len(fd.Parameters)
@@ -58,6 +63,40 @@ type generator struct {
 	// does - a syntactic heuristic, not real taint tracking, matching
 	// the reference's own known gap rather than introducing a new one.
 	secretVars map[string]bool
+	// namePrefix is prepended to every top-level function name this
+	// generator renders or references as a global - "" for the program's
+	// own generator, "array_" for the sub-generator ensureArrayLinked uses
+	// to compile core.array.ca's functions into the same module (D18).
+	// Keeps array.ca's own names (including private helpers like
+	// _reverse_fn) from colliding with the program's own functions.
+	namePrefix string
+
+	// arraySource, if set (via WithArraySource), is calcium-lang's
+	// pkg/vm/stdlib/core/array.ca source - core.array's non-primitive
+	// functions (D8: compiled Calcium logic, not primitive passthroughs)
+	// are inlined into this module on first use, prefixed "array_"
+	// (D18). arrayFuncs is populated by ensureArrayLinked with every
+	// function array.ca declares (name -> arity, unprefixed), so
+	// stdlibTarget can tell "needs linking" apart from "really isn't a
+	// core.array function". extraFuncs/extraExports collect the
+	// generated Erlang function sources/export entries for renderModule
+	// to append once linking happens.
+	arraySource  string
+	arrayLinked  bool
+	arrayFuncs   map[string]int
+	extraFuncs   []string
+	extraExports []string
+}
+
+// Option configures a generator before it renders a module.
+type Option func(*generator)
+
+// WithArraySource supplies calcium-lang's own core.array.ca source, so
+// `array.<fn>` calls to one of its non-primitive functions (reverse, sum,
+// take, sort, ...) can be auto-linked instead of failing to compile. See
+// docs/DECISIONS.md D18.
+func WithArraySource(src string) Option {
+	return func(g *generator) { g.arraySource = src }
 }
 
 func (g *generator) renderModule(program *ast.Program) (string, error) {
@@ -100,6 +139,13 @@ func (g *generator) renderModule(program *ast.Program) (string, error) {
 			}
 		}
 	}
+
+	// Auto-linked core.array functions (D18) - exported too, even though
+	// main/0 and the program's own functions are the only callers, so
+	// erlc doesn't warn about the ones this particular program never
+	// happens to call.
+	funcs = append(funcs, g.extraFuncs...)
+	exports = append(exports, g.extraExports...)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "-module(%s).\n", erlAtom(g.module))
@@ -180,7 +226,7 @@ func (g *generator) functionDecl(fd *ast.FunctionDeclaration) (string, error) {
 		body = fmt.Sprintf("{ok, %s}", body)
 	}
 
-	return fmt.Sprintf("%s(%s) ->\n    %s.", erlAtom(fd.Name.Value), strings.Join(params, ", "), body), nil
+	return fmt.Sprintf("%s(%s) ->\n    %s.", erlAtom(g.namePrefix+fd.Name.Value), strings.Join(params, ", "), body), nil
 }
 
 // isDirectPrimitiveOrStdlibCall reports whether e is a call whose target is
@@ -219,7 +265,7 @@ func (g *generator) expr(e ast.Expression) (string, error) {
 		// calling it) needs an explicit fun reference - plain `erlAtom(name)`
 		// in an expression position is a 0-ary call attempt, not a value.
 		if arity, ok := g.globals[n.Value]; ok {
-			return fmt.Sprintf("fun %s/%d", erlAtom(n.Value), arity), nil
+			return fmt.Sprintf("fun %s/%d", erlAtom(g.namePrefix+n.Value), arity), nil
 		}
 		// A bare capitalized name is a zero-argument ADT variant used as a
 		// value (e.g. `None` in `type Maybe = Some(value) | None;`) -
@@ -747,7 +793,7 @@ func (g *generator) callTarget(fn ast.Expression) (string, error) {
 	switch f := fn.(type) {
 	case *ast.Identifier:
 		if _, ok := g.globals[f.Value]; ok {
-			return erlAtom(f.Value), nil
+			return erlAtom(g.namePrefix + f.Value), nil
 		}
 		// A global built-in reached as a pipe/call target without its own
 		// argument list, e.g. `filter(arr, pred) |> len` (len applied to
@@ -787,11 +833,69 @@ func (g *generator) stdlibTarget(m *ast.MemberExpression) (string, error) {
 		return "", fmt.Errorf("codegen: unsupported member call target %T", m.Object)
 	}
 	key := obj.Value + "." + m.Property.Value
-	target, ok := stdlibCalls[key]
-	if !ok {
-		return "", fmt.Errorf("codegen: %s is not yet mapped to an erl/ implementation (later stage)", key)
+	if target, ok := stdlibCalls[key]; ok {
+		return target, nil
 	}
-	return target, nil
+	// core.array's non-primitive functions (reverse, sum, take, sort, ...)
+	// aren't primitive passthroughs like core.string's (D8), so there's no
+	// fixed stdlibCalls entry for them - auto-link calcium-lang's own
+	// array.ca into this module instead (D18).
+	if obj.Value == "array" {
+		if err := g.ensureArrayLinked(); err != nil {
+			return "", err
+		}
+		if _, ok := g.arrayFuncs[m.Property.Value]; ok {
+			return erlAtom("array_" + m.Property.Value), nil
+		}
+	}
+	return "", fmt.Errorf("codegen: %s is not yet mapped to an erl/ implementation (later stage)", key)
+}
+
+// ensureArrayLinked lazily compiles calcium-lang's core.array.ca (supplied
+// via WithArraySource) into this module, with every top-level name
+// (including private helpers like _reverse_fn) prefixed "array_" so they
+// can't collide with the program's own functions (D18). A no-op if already
+// linked, or if no array source was supplied (the caller still gets the
+// ordinary "not yet mapped" error in that case).
+func (g *generator) ensureArrayLinked() error {
+	if g.arrayLinked {
+		return nil
+	}
+	g.arrayLinked = true
+	if g.arraySource == "" {
+		return nil
+	}
+
+	l := lexer.New(g.arraySource)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if errs := p.Errors(); len(errs) > 0 {
+		return fmt.Errorf("codegen: parsing core.array.ca: %v", errs)
+	}
+
+	sub := &generator{
+		module: g.module, namePrefix: "array_",
+		globals: map[string]int{}, effectFuncs: map[string]bool{}, secretVars: map[string]bool{},
+	}
+	for _, stmt := range program.Statements {
+		if fd, ok := stmt.(*ast.FunctionDeclaration); ok {
+			sub.globals[fd.Name.Value] = len(fd.Parameters)
+		}
+	}
+	for _, stmt := range program.Statements {
+		fd, ok := stmt.(*ast.FunctionDeclaration)
+		if !ok {
+			continue
+		}
+		src, err := sub.functionDecl(fd)
+		if err != nil {
+			return fmt.Errorf("codegen: compiling core.array.ca's %s: %w", fd.Name.Value, err)
+		}
+		g.extraFuncs = append(g.extraFuncs, src)
+		g.extraExports = append(g.extraExports, fmt.Sprintf("%s/%d", erlAtom("array_"+fd.Name.Value), len(fd.Parameters)))
+	}
+	g.arrayFuncs = sub.globals
+	return nil
 }
 
 // stdlibValue resolves a `module.member` expression used as a plain value

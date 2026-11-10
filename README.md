@@ -55,9 +55,9 @@ All five planned stages are implemented:
    `head`/`tail` Maybe semantics, pipes.
 3. A differential test harness (`tests/differential`) that runs the same
    `.ca` program under the pinned reference `calcium` binary and under
-   `calciumbeam` + `erlc`/`erl`, and diffs the output. Currently 12/13 of
-   the corpus matches exactly; the one known gap (`core.array`
-   auto-linking) is documented in `docs/DECISIONS.md`.
+   `calciumbeam` + `erlc`/`erl`, and diffs the output. The full corpus
+   (13/13) matches exactly and the CI job is a real gate, not
+   `continue-on-error`.
 4. `async.spawn`/`all`/`expects`/`stay`/`continue`/`leave`/`cancel` —
    compiled to native BEAM processes and messages, not a reimplemented
    scheduler.

@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -51,7 +52,19 @@ func run(path string) error {
 	// generate a module that shadows Erlang/OTP's own math/string/... when
 	// both end up on the same code path - see docs/DECISIONS.md D9.
 	moduleName := "calcium_" + strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	erl, err := codegen.Module(moduleName, program)
+
+	var opts []codegen.Option
+	// core.array's non-primitive functions need calcium-lang's own
+	// array.ca auto-linked in (D18) - only bother resolving and reading it
+	// when the source might actually need it, since that costs a `go
+	// list` round trip.
+	if strings.Contains(string(src), "array.") {
+		if arraySrc, err := readStdlibFile("array.ca"); err == nil {
+			opts = append(opts, codegen.WithArraySource(arraySrc))
+		}
+	}
+
+	erl, err := codegen.Module(moduleName, program, opts...)
 	if err != nil {
 		return err
 	}
@@ -62,4 +75,20 @@ func run(path string) error {
 	}
 	fmt.Printf("wrote %s\n", outPath)
 	return nil
+}
+
+// readStdlibFile reads a file from calcium-lang's pkg/vm/stdlib/core,
+// resolving the module's location the same way tests/differential does
+// (via `go list -m`, not an assumed sibling checkout).
+func readStdlibFile(name string) (string, error) {
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/ytnobody/calcium-lang").Output()
+	if err != nil {
+		return "", err
+	}
+	dir := strings.TrimSpace(string(out))
+	src, err := os.ReadFile(filepath.Join(dir, "pkg", "vm", "stdlib", "core", name))
+	if err != nil {
+		return "", err
+	}
+	return string(src), nil
 }

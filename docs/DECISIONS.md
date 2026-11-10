@@ -515,3 +515,30 @@ shows up.
 
 Differential corpus: 12/13 (`hash.ca` now matches exactly). Only
 `pipeline.ca`'s `core.array` auto-linking gap remains (see D13).
+
+## D18 — `core.array` auto-linking: inline calcium-lang's own array.ca (**decided**)
+
+D13 flagged `core.array`'s non-primitive functions (`reverse`, `sum`,
+`take`, `sort`, ...) as unreachable via `array.foo(...)`, since unlike
+`core.string`'s functions they're compiled Calcium logic (D8), not
+primitive passthroughs, so there's no native `erl/` implementation to
+alias them to.
+
+Fixed by auto-linking: when a program's source mentions `array.` at all,
+`cmd/calciumbeam` resolves calcium-lang's own `pkg/vm/stdlib/core/array.ca`
+(the same `go list -m` resolution `tests/differential` already used, not an
+assumed sibling checkout) and passes it to `codegen.Module` via the new
+`WithArraySource` option. `stdlibTarget` tries this lazily
+(`ensureArrayLinked`) the first time an `array.<fn>` call isn't one of
+`stdlibCalls`'s fixed entries: it lexes/parses `array.ca` once and compiles
+every top-level function (including private helpers like `_reverse_fn`)
+into the same output module, each name prefixed `array_` (a new
+`generator.namePrefix` field, applied everywhere a global function name is
+emitted or referenced) so they can't collide with the program's own
+functions. All of array.ca's functions get compiled and exported
+unconditionally once linking triggers — not just the ones actually called —
+since `array.ca` is small and this avoids needing dead-code elimination or
+a second pass to know which helpers a given function transitively needs.
+
+Differential corpus: 13/13. `continue-on-error` removed from the CI
+`differential` job — it's a real gate now.
