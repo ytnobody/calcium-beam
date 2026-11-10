@@ -64,6 +64,25 @@ func run(path string) error {
 		}
 	}
 
+	// Project-local modules (D19) - unconditional, unlike array.ca above:
+	// resolution is a few extra in-process lexer/parser passes over
+	// already-local files, not a `go list` shell-out, so there's nothing
+	// worth gating behind a substring check. Returns an empty list (no
+	// extra cost beyond one scan of the entry program's own statements)
+	// when nothing is imported.
+	mods, err := resolveModules(path, program)
+	if err != nil {
+		return err
+	}
+	if len(mods) > 0 {
+		entryDir := filepath.Dir(path)
+		linked := make([]codegen.LinkedModule, len(mods))
+		for i, m := range mods {
+			linked[i] = codegen.LinkedModule{Alias: m.Alias, Prefix: modulePrefix(entryDir, m.Path), Program: m.Program}
+		}
+		opts = append(opts, codegen.WithLocalModules(linked))
+	}
+
 	erl, err := codegen.Module(moduleName, program, opts...)
 	if err != nil {
 		return err
@@ -75,6 +94,26 @@ func run(path string) error {
 	}
 	fmt.Printf("wrote %s\n", outPath)
 	return nil
+}
+
+// modulePrefix derives a linked module's Erlang name prefix from its
+// resolved path, relative to the entry file's directory when possible (so
+// two sibling projects compiled separately don't produce prefixes that
+// depend on an absolute filesystem layout) - see docs/DECISIONS.md D19.
+func modulePrefix(entryDir, resolvedPath string) string {
+	rel, err := filepath.Rel(entryDir, resolvedPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		rel = resolvedPath
+	}
+	rel = strings.TrimSuffix(rel, filepath.Ext(rel))
+	rel = strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', '.', '-':
+			return '_'
+		}
+		return r
+	}, rel)
+	return strings.Trim(rel, "_") + "_"
 }
 
 // readStdlibFile reads a file from calcium-lang's pkg/vm/stdlib/core,
