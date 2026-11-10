@@ -7,9 +7,21 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ytnobody/calcium-lang/pkg/ast"
 	"github.com/ytnobody/calcium-lang/pkg/lexer"
 	"github.com/ytnobody/calcium-lang/pkg/parser"
 )
+
+func parseProgram(t *testing.T, src string) *ast.Program {
+	t.Helper()
+	l := lexer.New(src)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	if errs := p.Errors(); len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	return program
+}
 
 func compile(t *testing.T, src string) string {
 	t.Helper()
@@ -639,5 +651,124 @@ to_string(result) !> io.say;`)
 	}
 	if !strings.Contains(got, "success(") || !strings.Contains(got, "test_sink_received") {
 		t.Errorf("expected the trusted sink to run once authorized:\n%s", got)
+	}
+}
+
+// TestLocalModuleCallResolves verifies D19: a call into a WithLocalModules-
+// supplied module compiles to its prefixed function name, not a "not yet
+// mapped" error.
+func TestLocalModuleCallResolves(t *testing.T) {
+	entry := parseProgram(t, `helper.double(5) !> io.say;`)
+	helperProgram := parseProgram(t, `func double(n) = n * 2;`)
+
+	out, err := Module("test", entry, WithLocalModules([]LinkedModule{
+		{Alias: "helper", Prefix: "helper_", Program: helperProgram},
+	}))
+	if err != nil {
+		t.Fatalf("codegen: %v", err)
+	}
+	if !strings.Contains(out, "'helper_double'(5)") {
+		t.Errorf("expected the call site to resolve to the prefixed function:\n%s", out)
+	}
+	if !strings.Contains(out, "'helper_double'(V_n) ->") {
+		t.Errorf("expected the linked module's function to be compiled and exported:\n%s", out)
+	}
+}
+
+// TestLocalModuleUnknownFunctionErrors verifies a typo'd function name in a
+// linked module is a clear compile error, not a silent miscompile.
+func TestLocalModuleUnknownFunctionErrors(t *testing.T) {
+	entry := parseProgram(t, `helper.nope(5) !> io.say;`)
+	helperProgram := parseProgram(t, `func double(n) = n * 2;`)
+
+	_, err := Module("test", entry, WithLocalModules([]LinkedModule{
+		{Alias: "helper", Prefix: "helper_", Program: helperProgram},
+	}))
+	if err == nil || !strings.Contains(err.Error(), `local module "helper" has no function "nope"`) {
+		t.Fatalf("expected a clear error naming the module and function, got %v", err)
+	}
+}
+
+// TestLocalModuleEffectFuncRejectedBySecretMap verifies a linked module's
+// func! function, referenced directly via Secret.map, is still rejected at
+// compile time - D19's extension of D16's purity check to a module-
+// qualified reference, not just a bare identifier.
+func TestLocalModuleEffectFuncRejectedBySecretMap(t *testing.T) {
+	entry := parseProgram(t, `s = Secret.wrap("x"); Secret.map(s, helper.leaky);`)
+	helperProgram := parseProgram(t, `func! leaky(x) = x !> io.say;`)
+
+	_, err := Module("test", entry, WithLocalModules([]LinkedModule{
+		{Alias: "helper", Prefix: "helper_", Program: helperProgram},
+	}))
+	if err == nil || !strings.Contains(err.Error(), "effect function") {
+		t.Fatalf("expected Secret.map to reject helper.leaky as an effect function, got %v", err)
+	}
+}
+
+// TestLocalModuleTransitiveImport verifies a module linked via
+// WithLocalModules can itself call into a sibling linked module - the
+// resolver flattens the whole import graph, and linkModule shares one
+// localModules map across every sub-generator so this resolves (D19).
+func TestLocalModuleTransitiveImport(t *testing.T) {
+	entry := parseProgram(t, `a.via_shared(5) !> io.say;`)
+	sharedProgram := parseProgram(t, `func id(x) = x;`)
+	aProgram := parseProgram(t, `func via_shared(x) = shared.id(x) * 10;`)
+
+	// Dependency-first order, matching what the resolver returns.
+	out, err := Module("test", entry, WithLocalModules([]LinkedModule{
+		{Alias: "shared", Prefix: "shared_", Program: sharedProgram},
+		{Alias: "a", Prefix: "a_", Program: aProgram},
+	}))
+	if err != nil {
+		t.Fatalf("codegen: %v", err)
+	}
+	if !strings.Contains(out, "'shared_id'(V_x)") {
+		t.Errorf("expected a's call into shared to resolve to the prefixed function:\n%s", out)
+	}
+}
+
+// TestLocalModuleEndToEnd compiles an entry program and a linked local
+// module to Erlang and actually runs the result on real BEAM - this
+// project's standing practice of trusting a real run over generated-text
+// assertions alone.
+func TestLocalModuleEndToEnd(t *testing.T) {
+	erlcPath, err := exec.LookPath("erlc")
+	if err != nil {
+		t.Skip("erlc not found, skipping end-to-end BEAM compile check")
+	}
+	erlPath, err := exec.LookPath("erl")
+	if err != nil {
+		t.Skip("erl not found, skipping end-to-end BEAM compile check")
+	}
+
+	entry := parseProgram(t, `use core.io!; use greet; greet.hello("world") !> io.say;`)
+	greetProgram := parseProgram(t, `func hello(name) = concat("Hello, ", name);`)
+
+	erlSrc, err := Module("calcium_localmod_test", entry, WithLocalModules([]LinkedModule{
+		{Alias: "greet", Prefix: "greet_", Program: greetProgram},
+	}))
+	if err != nil {
+		t.Fatalf("codegen: %v", err)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "calcium_localmod_test.erl"), []byte(erlSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", "erl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-o", dir, filepath.Join(repoRoot, "calcium_builtins.erl"), filepath.Join(repoRoot, "calcium_io_native.erl"), filepath.Join(dir, "calcium_localmod_test.erl")}
+	if out, err := exec.Command(erlcPath, args...).CombinedOutput(); err != nil {
+		t.Fatalf("erlc failed: %v\n%s", err, out)
+	}
+
+	out, err := exec.Command(erlPath, "-noshell", "-pa", dir, "-eval", "calcium_localmod_test:main(), halt().").CombinedOutput()
+	if err != nil {
+		t.Fatalf("erl run failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "Hello, world" {
+		t.Errorf("expected %q, got %q", "Hello, world", strings.TrimSpace(string(out)))
 	}
 }

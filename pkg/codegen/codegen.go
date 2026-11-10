@@ -33,7 +33,62 @@ func Module(moduleName string, program *ast.Program, opts ...Option) (string, er
 			}
 		}
 	}
+	g.localModules = map[string]*linkedModuleInfo{}
+	for _, mod := range g.pendingLocalModules {
+		if err := g.linkModule(mod); err != nil {
+			return "", err
+		}
+	}
 	return g.renderModule(program)
+}
+
+// linkModule compiles one resolved local module's top-level functions into
+// this generator's extraFuncs/extraExports, prefixed per mod.Prefix, and
+// records it in g.localModules so stdlibTarget can resolve `alias.fn(...)`
+// calls into it. Unlike ensureArrayLinked, this runs eagerly (from Module,
+// for every module WithLocalModules supplied) rather than lazily on first
+// use - see docs/DECISIONS.md D19 for why that's the right tradeoff here.
+func (g *generator) linkModule(mod LinkedModule) error {
+	sub := &generator{
+		module: g.module, namePrefix: mod.Prefix,
+		globals: map[string]int{}, effectFuncs: map[string]bool{}, secretVars: map[string]bool{},
+		// Shared, not copied: the resolver returns modules in
+		// dependency-first order, so a module that itself uses another
+		// local module finds that sibling already linked here by the
+		// time this one compiles - transitive `use` works the same way
+		// it does for the entry program.
+		localModules: g.localModules,
+	}
+	for _, stmt := range mod.Program.Statements {
+		if fd, ok := stmt.(*ast.FunctionDeclaration); ok {
+			sub.globals[fd.Name.Value] = len(fd.Parameters)
+			if fd.IsEffect {
+				sub.effectFuncs[fd.Name.Value] = true
+			}
+		}
+	}
+	for _, stmt := range mod.Program.Statements {
+		fd, ok := stmt.(*ast.FunctionDeclaration)
+		if !ok {
+			continue
+		}
+		src, err := sub.functionDecl(fd)
+		if err != nil {
+			return fmt.Errorf("codegen: compiling local module %q's %s: %w", mod.Alias, fd.Name.Value, err)
+		}
+		g.extraFuncs = append(g.extraFuncs, src)
+		g.extraExports = append(g.extraExports, fmt.Sprintf("%s/%d", erlAtom(mod.Prefix+fd.Name.Value), len(fd.Parameters)))
+	}
+	// Propagate under the prefixed name: a direct reference to another
+	// module's func! function (e.g. passed to Secret.map) must still be
+	// rejected at compile time by D16's purity check, which only looks at
+	// g.effectFuncs. D18's array.ca never needed this (it declares no
+	// effect functions).
+	for name := range sub.effectFuncs {
+		g.effectFuncs[mod.Prefix+name] = true
+	}
+	g.localModules[mod.Alias] = &linkedModuleInfo{prefix: mod.Prefix, funcs: sub.globals}
+	return nil
 }
 
 type generator struct {
@@ -86,6 +141,29 @@ type generator struct {
 	arrayFuncs   map[string]int
 	extraFuncs   []string
 	extraExports []string
+
+	// localModules holds every project-local module resolved by
+	// cmd/calciumbeam's resolver (see WithLocalModules), keyed by import
+	// alias. Unlike array.ca's lazy ensureArrayLinked, these are compiled
+	// eagerly in Module() - the resolver has already paid the cost of
+	// parsing every file to discover the import graph, so there's no
+	// "only pay for it if used" benefit left to defer. See
+	// docs/DECISIONS.md D19.
+	localModules map[string]*linkedModuleInfo
+	// pendingLocalModules stashes WithLocalModules' argument until
+	// Module() is ready to link them (after globals/effectFuncs are
+	// collected for the main program, so link order can't matter).
+	pendingLocalModules []LinkedModule
+}
+
+// linkedModuleInfo is what stdlibTarget needs to resolve a call into an
+// already-compiled local module: its chosen Erlang name prefix, and which
+// functions it actually declares (name -> arity, unprefixed) so a typo'd
+// function name still gets a clear error instead of silently generating a
+// call to a function that was never compiled.
+type linkedModuleInfo struct {
+	prefix string
+	funcs  map[string]int
 }
 
 // Option configures a generator before it renders a module.
@@ -97,6 +175,30 @@ type Option func(*generator)
 // docs/DECISIONS.md D18.
 func WithArraySource(src string) Option {
 	return func(g *generator) { g.arraySource = src }
+}
+
+// LinkedModule is a project-local Calcium module (resolved by
+// cmd/calciumbeam/resolve.go) to compile into the same output module,
+// alongside the program that imports it. See docs/DECISIONS.md D19.
+type LinkedModule struct {
+	// Alias is how the importing program calls into this module
+	// (`Alias.fn(...)`).
+	Alias string
+	// Prefix is the Erlang name prefix this module's functions render
+	// under (e.g. "utils_helper_") - caller-derived from the module's
+	// resolved file path, so two different local modules can never guess
+	// their way into the same prefix the way two callers both naming
+	// "array_" by convention could.
+	Prefix  string
+	Program *ast.Program
+}
+
+// WithLocalModules supplies every project-local module a program's `use`
+// statements resolved to (see cmd/calciumbeam/resolve.go), so
+// `alias.fn(...)` calls into them compile instead of failing with "not yet
+// mapped". See docs/DECISIONS.md D19.
+func WithLocalModules(mods []LinkedModule) Option {
+	return func(g *generator) { g.pendingLocalModules = mods }
 }
 
 func (g *generator) renderModule(program *ast.Program) (string, error) {
@@ -500,6 +602,17 @@ func (g *generator) secretCall(property string, rawArgs []ast.Expression, args [
 		if ident, ok := rawArgs[1].(*ast.Identifier); ok && g.effectFuncs[ident.Value] {
 			return "", fmt.Errorf("codegen: Secret.map: callback must be a pure function, got effect function %q", ident.Value)
 		}
+		// Same check for a reference into a linked local module
+		// (`helper.someEffectFn` - D19): resolve the alias to its
+		// module's prefix and look up the prefixed name, the same way
+		// linkModule recorded it.
+		if m, ok := rawArgs[1].(*ast.MemberExpression); ok {
+			if obj, ok := m.Object.(*ast.Identifier); ok {
+				if info, ok := g.localModules[obj.Value]; ok && g.effectFuncs[info.prefix+m.Property.Value] {
+					return "", fmt.Errorf("codegen: Secret.map: callback must be a pure function, got effect function %q", obj.Value+"."+m.Property.Value)
+				}
+			}
+		}
 		return fmt.Sprintf("calcium_secret:map(%s, %s)", args[0], args[1]), nil
 	case "capability":
 		if len(rawArgs) != 2 {
@@ -767,9 +880,14 @@ func (g *generator) call(n *ast.CallExpression) (string, error) {
 		// reached when the object isn't a known stdlib module name
 		// (module.function calls are handled by stdlibTarget below via
 		// callTarget, before this would ever be considered); see
-		// docs/DECISIONS.md D15.
+		// docs/DECISIONS.md D15. A project-local module (D19) is a module
+		// name too, even though it's not in the hardcoded stdlibModuleObjects
+		// set - checked here so `helper.fn(...)` doesn't fall through to
+		// treating `helper` as a runtime value.
 		if obj, ok := m.Object.(*ast.Identifier); ok {
-			if _, isStdlibModule := stdlibModuleObjects[obj.Value]; !isStdlibModule {
+			_, isLocalModule := g.localModules[obj.Value]
+			_, isStdlibModule := stdlibModuleObjects[obj.Value]
+			if !isStdlibModule && !isLocalModule {
 				objSrc, err := g.expr(m.Object)
 				if err != nil {
 					return "", err
@@ -847,6 +965,16 @@ func (g *generator) stdlibTarget(m *ast.MemberExpression) (string, error) {
 		if _, ok := g.arrayFuncs[m.Property.Value]; ok {
 			return erlAtom("array_" + m.Property.Value), nil
 		}
+	}
+	// A project-local module resolved by cmd/calciumbeam's resolver and
+	// compiled eagerly in Module() (D19) - a separate mechanism from
+	// array.ca's lazy, hardcoded one above, kept side by side rather than
+	// unified (see the design discussion on issue #1).
+	if info, ok := g.localModules[obj.Value]; ok {
+		if _, ok := info.funcs[m.Property.Value]; ok {
+			return erlAtom(info.prefix + m.Property.Value), nil
+		}
+		return "", fmt.Errorf("codegen: local module %q has no function %q", obj.Value, m.Property.Value)
 	}
 	return "", fmt.Errorf("codegen: %s is not yet mapped to an erl/ implementation (later stage)", key)
 }
