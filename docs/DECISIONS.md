@@ -467,7 +467,10 @@ the calcium-beam side, not just read off the Go source.
   compiles separate single-file programs, never one program importing
   another's compiled code) - every compiled program trivially *is* the
   only module. Documented as a collapsed check, not silently dropped;
-  revisit if multi-module linking is ever added.
+  revisit if multi-module linking is ever added. Still true after D19:
+  local-module linking inlines every linked `.ca` file's functions into
+  the *same single Erlang module* - one compiled program is still
+  structurally one module, not several, for this check's purposes.
 
 ### A real, net gap relative to the reference (not glossed over)
 
@@ -542,3 +545,70 @@ a second pass to know which helpers a given function transitively needs.
 
 Differential corpus: 13/13. `continue-on-error` removed from the CI
 `differential` job — it's a real gate now.
+
+## D19 — Project-local Calcium modules (`use mymodule;`) (**decided**)
+
+See https://github.com/ytnobody/calcium-beam/issues/1 for the full design and
+implementation-plan discussion this implements. Checked against the
+reference directly (`specs/module-import-spec.md`, `pkg/compiler/compiler.go`'s
+`*ast.UseStatement` case): the reference resolves and loads every module
+**dynamically at runtime** (`OpLoadModule`, with its own in-memory/local/
+global-cache/remote-fetch resolution order and a `bone` package-manager
+story). That's the right model for a bytecode VM with a cache/fetch step
+already built in; it's the wrong one to copy onto an AOT Erlang target. Per
+D1/D2's precedent (reuse the frontend exactly, adapt the backend to BEAM
+rather than mirror VM internals 1:1), this generalizes D18's compile-time
+inlining instead.
+
+**Scope: phase 1 only** - project-local modules (`use mymodule;` ->
+`./mymodule.ca` or `./mymodule/mod.ca`, resolved relative to the importing
+file). Boneyard/GitHub external modules, version constraints, and `pub use
+... as` re-exports are explicitly out of scope (tracked as a phase 2 in
+issue #1) - none of these exist as a real dependency-fetching story in
+`calciumbeam` today.
+
+### What was built
+
+- `cmd/calciumbeam/resolve.go`: finds every local-module `use` statement
+  reachable from the entry file (transitively - a linked module may itself
+  `use` other local modules), parses each exactly once (dedup by resolved
+  absolute path, not import spelling), and detects import cycles.
+- `pkg/codegen`'s `LinkedModule`/`WithLocalModules` generalize D18's single
+  hardcoded `"array_"`-prefix inlining (`ensureArrayLinked`) to any number
+  of resolved modules, each getting its own sanitized-path-derived prefix
+  (`generator.namePrefix`, already existing from D18). Linked **eagerly**
+  in `Module()`, not lazily like array.ca - the resolver has already paid
+  the cost of parsing every file to discover the import graph, so there's
+  no "only compile it if used" benefit left to defer.
+- A linked module's own `func!` functions propagate into `effectFuncs`
+  under their prefixed name, and `Secret.map`'s compile-time purity check
+  (D16) was extended to also recognize a module-qualified reference
+  (`helper.someEffectFn`), not just a bare identifier - a real gap D18
+  never exposed, since `array.ca` declares no effect functions.
+- Sub-generators share one `localModules` map, so a linked module that
+  itself imports another linked module resolves correctly, relying on the
+  resolver's dependency-first ordering (a module's own dependencies are
+  always linked - and so already present in the shared map - before it
+  is).
+- `cmd/calciumbeam/main.go` calls the resolver unconditionally (no
+  substring-gate, unlike array.ca's `go list` shell-out) - cheap, since
+  it's just a few extra in-process lexer/parser passes over files already
+  on disk, returning immediately with nothing to do for a program with no
+  local `use` statements.
+
+Verified end-to-end on real BEAM (not just generated-text assertions): a
+two-file program (`main.ca` importing `greet.ca`) compiled, `erlc`'d, and
+run via both a direct codegen-level test and a full CLI-level test
+(`cmd/calciumbeam/e2e_test.go`) covering resolve -> codegen -> erlc -> erl.
+
+### Known limitations (phase 1, stated plainly)
+
+- No Boneyard/GitHub external modules, no version constraints/lock file,
+  no `pub`/visibility keyword (the reference doesn't have the latter
+  either yet - still "Future Enhancements" in its own spec).
+- Still inlines every linked module into one output `.erl` file, not real
+  multi-module Erlang/OTP (`other_module:fn(Args)` across separate
+  compiled modules) - simplest, and consistent with D8's "no multi-module
+  linking" scope at the Erlang-module level specifically (see the D16
+  addendum above). Revisit only if/when calciumbeam needs to produce
+  something closer to a normal multi-module OTP release.
