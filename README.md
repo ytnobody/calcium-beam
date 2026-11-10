@@ -68,3 +68,25 @@ All five planned stages are implemented:
 Each stage's known limitations are stated explicitly in `docs/DECISIONS.md`
 rather than left implicit — read it before relying on this for anything
 beyond the documented scope.
+
+## Local Calcium modules
+
+A program can `use` another project-local `.ca` file:
+
+```calcium
+// main.ca
+use core.io!;
+use greet;
+
+greet.hello("world") !> io.say;
+```
+
+```calcium
+// greet.ca
+func hello(name) = concat("Hello, ", name);
+```
+
+`greet.ca` is resolved relative to `main.ca` (`./greet.ca` or
+`./greet/mod.ca`), and inlined into the same output module. Boneyard/GitHub
+external modules aren't supported yet — see `docs/DECISIONS.md` D19 and
+[issue #1](https://github.com/ytnobody/calcium-beam/issues/1).
