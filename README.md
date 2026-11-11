@@ -87,6 +87,29 @@ func hello(name) = concat("Hello, ", name);
 ```
 
 `greet.ca` is resolved relative to `main.ca` (`./greet.ca` or
-`./greet/mod.ca`), and inlined into the same output module. Boneyard/GitHub
-external modules aren't supported yet — see `docs/DECISIONS.md` D19 and
-[issue #1](https://github.com/ytnobody/calcium-beam/issues/1).
+`./greet/mod.ca`), and inlined into the same output module.
+
+## Boneyard/GitHub external modules
+
+A program can also `use` a module already fetched by the reference
+`calcium`/`bone` tooling:
+
+```sh
+go run github.com/ytnobody/calcium-lang/cmd/bone add ytnobody/greet
+```
+
+```calcium
+// main.ca
+use core.io!;
+use ytnobody/greet;
+
+greet.hello("world") !> io.say;
+```
+
+`calciumbeam` never fetches anything over the network itself — it only
+looks for `calcium_modules/ytnobody/greet/mod.ca` (walked up from `main.ca`'s
+directory) and `~/.calcium/cache/ytnobody/greet/mod.ca`, exactly where
+`bone add`/`bone add --global` leaves it. If neither is found, compilation
+fails with an error naming the `bone add` command to run — see
+`docs/DECISIONS.md` D20 and
+[issue #6](https://github.com/ytnobody/calcium-beam/issues/6).
