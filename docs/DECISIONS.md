@@ -612,3 +612,85 @@ run via both a direct codegen-level test and a full CLI-level test
   linking" scope at the Erlang-module level specifically (see the D16
   addendum above). Revisit only if/when calciumbeam needs to produce
   something closer to a normal multi-module OTP release.
+
+## D20 — Boneyard/GitHub external modules (phase 2 of `use`) (**decided**)
+
+See https://github.com/ytnobody/calcium-beam/issues/6 for the full design and
+implementation-plan discussion this implements - phase 2 of the module
+system D19 deferred. Checked directly against the reference
+(`pkg/ast/ast.go`'s `ModulePath`, `pkg/compiler/compiler.go`'s
+`*ast.UseStatement` case, `pkg/vm/stdlib.go`'s `LoadRemoteModule`/
+`LoadGitHubURLModule`, `pkg/vm/cache.go`, `pkg/bone/add.go`) rather than
+assumed from `specs/module-import-spec.md`'s prose alone.
+
+**The key fact that shapes this decision**: version resolution
+(`meta.toml`'s `^1.0.0` constraints, `calcium.lock`) happens entirely in
+the `bone` CLI, at `bone add` time, when it writes a specific commit's
+`mod.ca` into `calcium_modules/` or `~/.calcium/cache/`. The reference
+VM's own module loader (`OpLoadModule` -> `LoadRemoteModule`/
+`LoadGitHubURLModule`) never resolves a version - it only ever reads
+whatever `mod.ca` is already sitting on disk. Versioning is a
+filesystem-population concern owned entirely by `bone`/Boneyard, not a
+load-time concern - so there is nothing version-related for
+calcium-beam to reimplement at all.
+
+### Scope: calcium-beam never fetches, ever
+
+Confirmed and locked in on issue #6: **no HTTP client, no Boneyard
+registry client, no GitHub URL fetching, no `calcium.lock` reading, in
+this repository.** `bone add author/module` / `bone add --global
+author/module` (the reference's own tooling, already built) is the only
+way a remote module's `mod.ca` ends up on disk; calcium-beam only ever
+*finds* it there, exactly as D19 already does for project-local files.
+
+### What was built
+
+- `cmd/calciumbeam/resolve.go`: `resolveModules` now branches on
+  `use.Path.IsRemote` (already present on the parsed AST - no parser
+  changes needed) and locates an already-fetched module by mirroring the
+  reference's own search order exactly:
+  - `use author/module;` (`ast.ModulePath.Author`/`.Name`) -
+    `calcium_modules/author/module/mod.ca`, walked up from the entry
+    file's directory (matching `getLocalModuleDirs`, not `bone`'s own
+    `meta.toml`-requiring `FindProjectRoot` - the VM loader itself
+    doesn't require a `meta.toml`, so neither does this resolver), then
+    `~/.calcium/cache/author/module/mod.ca`.
+  - `use "github.com/author/repo";` (`ast.ModulePath.RawURL`) -
+    `~/.calcium/cache/author/repo/mod.ca` **only**. `LoadGitHubURLModule`
+    never consults `calcium_modules/` for this form in the reference -
+    verified directly, not assumed - so this resolver doesn't either.
+  - The `-calcium` suffix is trimmed from the call-site alias for the
+    raw-URL form only (matching the compiler's `moduleName` derivation);
+    the cache directory name itself keeps the suffix (matching
+    `parseGitHubURL`, which never trims it).
+  - Not found in either location -> a compile error naming every path
+    tried and suggesting the exact `bone add` command to run - never a
+    silent failure, never an attempted fetch.
+- `cmd/calciumbeam/main.go`: a remote module's Erlang name prefix
+  (`remoteModulePrefix`) is derived from its `(author, name)` pair
+  directly, not from relativizing its on-disk path against the entry
+  file's directory like D19's `modulePrefix` does for local modules -
+  `calcium_modules/`/the global cache aren't "near" the entry file in any
+  meaningful sense, and two projects importing the same remote module
+  should get the same stable prefix regardless of where either project's
+  entry file lives.
+- **No `pkg/codegen` changes at all.** `LinkedModule`/`WithLocalModules`
+  (D19) already treat "a parsed `*ast.Program` plus a prefix" as the
+  entire contract - a remote-sourced module satisfies it identically to a
+  local one once resolved. Verified, not assumed: a full CLI-level
+  end-to-end test (`TestRemoteModuleCLIEndToEnd`) compiles, `erlc`'s, and
+  runs on real BEAM a program importing a module placed in
+  `calcium_modules/`, exactly where `bone add` would leave it, with zero
+  production-code changes beyond resolve.go/main.go above.
+
+### Known limitations (phase 2, stated plainly)
+
+- No `calcium.lock` reading/writing (per the key fact above, the
+  reference's own VM doesn't consult it either - nothing to match).
+- No version constraints of any kind are evaluated by calcium-beam -
+  whichever version `bone add` last wrote to disk is what gets compiled,
+  same as the reference's own runtime behavior.
+- `pub use ... as` re-exports are still "Future Enhancements" in the
+  reference's own spec - nothing to match yet.
+- Still inlines every linked module into one output `.erl` file (same
+  limitation D19 already states, inherited unchanged).
