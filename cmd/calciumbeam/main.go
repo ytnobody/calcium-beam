@@ -78,7 +78,11 @@ func run(path string) error {
 		entryDir := filepath.Dir(path)
 		linked := make([]codegen.LinkedModule, len(mods))
 		for i, m := range mods {
-			linked[i] = codegen.LinkedModule{Alias: m.Alias, Prefix: modulePrefix(entryDir, m.Path), Program: m.Program}
+			prefix := modulePrefix(entryDir, m.Path)
+			if m.IsRemote {
+				prefix = remoteModulePrefix(m.Author, m.Name)
+			}
+			linked[i] = codegen.LinkedModule{Alias: m.Alias, Prefix: prefix, Program: m.Program}
 		}
 		opts = append(opts, codegen.WithLocalModules(linked))
 	}
@@ -106,14 +110,32 @@ func modulePrefix(entryDir, resolvedPath string) string {
 		rel = resolvedPath
 	}
 	rel = strings.TrimSuffix(rel, filepath.Ext(rel))
-	rel = strings.Map(func(r rune) rune {
+	return sanitizePrefix(rel)
+}
+
+// sanitizePrefix turns an arbitrary path-like string into a valid Erlang
+// identifier fragment - shared by modulePrefix (local modules, relative to
+// the entry file) and remoteModulePrefix (remote modules, which have no
+// such relative path to begin with - see docs/DECISIONS.md D20).
+func sanitizePrefix(s string) string {
+	s = strings.Map(func(r rune) rune {
 		switch r {
 		case '/', '\\', '.', '-':
 			return '_'
 		}
 		return r
-	}, rel)
-	return strings.Trim(rel, "_") + "_"
+	}, s)
+	return strings.Trim(s, "_") + "_"
+}
+
+// remoteModulePrefix derives a Boneyard/GitHub module's Erlang name prefix
+// directly from its (author, name) pair, not its on-disk location -
+// calcium_modules/ and the global cache aren't "near" the entry file in any
+// meaningful relative sense, and two projects importing the same remote
+// module should get the same stable prefix regardless of where either
+// project's entry file lives.
+func remoteModulePrefix(author, name string) string {
+	return sanitizePrefix(author + "_" + name)
 }
 
 // readStdlibFile reads a file from calcium-lang's pkg/vm/stdlib/core,
